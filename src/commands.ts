@@ -44,9 +44,6 @@ import skills from './commands/skills/index.js'
 import status from './commands/status/index.js'
 import tasks from './commands/tasks/index.js'
 import teleport from './commands/teleport/index.js'
-import attach from './commands/attach/index.js'
-import detach from './commands/detach/index.js'
-import pipes from './commands/pipes/index.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const agentsPlatform =
   process.env.USER_TYPE === 'ant'
@@ -59,6 +56,12 @@ import terminalSetup from './commands/terminalSetup/index.js'
 import usage from './commands/usage/index.js'
 import theme from './commands/theme/index.js'
 import vim from './commands/vim/index.js'
+import attach from './commands/attach/index.js'
+import detach from './commands/detach/index.js'
+import pipes from './commands/pipes/index.js'
+import send from './commands/send/index.js'
+import pipeHistory from './commands/history/index.js'
+import pipeStatus from './commands/pipe-status/index.js'
 import { feature } from 'bun:bundle'
 // Dead code elimination: conditional imports
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -329,6 +332,12 @@ const COMMANDS = memoize((): Command[] => [
   ...(bridge ? [bridge] : []),
   ...(remoteControlServerCommand ? [remoteControlServerCommand] : []),
   ...(voiceCommand ? [voiceCommand] : []),
+  attach,
+  detach,
+  pipes,
+  send,
+  pipeHistory,
+  pipeStatus,
   thinkback,
   thinkbackPlay,
   permissions,
@@ -341,9 +350,6 @@ const COMMANDS = memoize((): Command[] => [
   passes,
   ...(peersCmd ? [peersCmd] : []),
   tasks,
-  attach,
-  detach,
-  pipes,
   ...(workflowsCmd ? [workflowsCmd] : []),
   ...(torch ? [torch] : []),
   ...(process.env.USER_TYPE === 'ant' && !process.env.IS_DEMO

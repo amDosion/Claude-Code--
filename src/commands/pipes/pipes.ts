@@ -15,7 +15,8 @@ export const call: LocalCommandCall = async (_args, context) => {
   lines.push(`Role:       ${role}`)
 
   if (role === 'master') {
-    lines.push(`Attached to: ${currentState.pipeIpc.attachedTo}`)
+    const slaveNames = Object.keys(currentState.pipeIpc.slaves)
+    lines.push(`Slaves (${slaveNames.length}): ${slaveNames.join(', ') || 'none'}`)
   } else if (role === 'slave') {
     lines.push(`Controlled by: ${currentState.pipeIpc.attachedBy}`)
   }
@@ -31,12 +32,14 @@ export const call: LocalCommandCall = async (_args, context) => {
     for (const name of otherPipes) {
       const alive = await isPipeAlive(name)
       const status = alive ? 'alive' : 'stale'
-      lines.push(`  ${name}  [${status}]`)
+      const isAttached = currentState.pipeIpc.slaves[name] ? ' [attached]' : ''
+      lines.push(`  ${name}  [${status}]${isAttached}`)
     }
   }
 
   lines.push('')
   lines.push('To attach: /attach <pipe-name>')
+  lines.push('To send:   /send <pipe-name> <message>')
 
   return { type: 'text', value: lines.join('\n') }
 }

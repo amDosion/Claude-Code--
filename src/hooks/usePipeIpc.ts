@@ -1,14 +1,21 @@
 /**
- * usePipeIpc — Slave-side named pipe IPC hook
+ * usePipeIpc — Per-CLI named pipe IPC hook
  *
- * Responsibilities:
- * 1. On mount: create a PipeServer for this CLI session (always)
- * 2. Handle attach_request → accept/reject based on current state
- * 3. When attached (slave mode):
- *    - Receive `prompt` messages → inject via onSubmitMessage (same path as useInboxPoller)
- *    - Relay AI output back to master via `stream`/`done` messages
- * 4. Handle detach → return to standalone mode
- * 5. On unmount: close server, clean up socket file
+ * Every CLI instance auto-starts a PipeServer on mount.
+ * Default role is 'standalone' — completely independent.
+ *
+ * When a master sends attach_request:
+ *   - Accept → switch to 'slave' role
+ *   - Begin auto-reporting all session events to master
+ *
+ * When a master sends prompt:
+ *   - Inject via onSubmitMessage (same path as useInboxPoller)
+ *
+ * When a master sends detach:
+ *   - Revert to standalone
+ *
+ * The globalThis.__pipeSendToMaster function is set when in slave mode
+ * so that REPL's onQueryEvent can relay AI output without importing hooks.
  */
 
 import { useCallback, useEffect, useRef } from 'react'
@@ -30,7 +37,6 @@ const PIPE_IPC_TAG = 'pipe_message'
 
 /**
  * Generate a short pipe name from the session ID.
- * Uses first 8 chars of the UUID for brevity.
  */
 function getSessionPipeName(): string {
   const sessionId = getSessionId()
@@ -49,11 +55,11 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
   const store = useAppStateStore()
   const pipeRole = useAppState((s) => s.pipeIpc.role)
 
-  // Refs to hold long-lived objects across renders
   const serverRef = useRef<PipeServer | null>(null)
+  // Track all connected master sockets (in slave mode, only one master at a time)
   const masterSocketRef = useRef<Socket | null>(null)
 
-  // ----- Send helper (slave → master) -----
+  // Send helper (slave → master)
   const sendToMaster = useCallback((msg: PipeMessage) => {
     const server = serverRef.current
     const masterSocket = masterSocketRef.current
@@ -62,12 +68,10 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
     }
   }, [])
 
-  // Expose sendToMaster for REPL to call when AI produces output
-  // We store it on the server instance for easy access
   const sendToMasterRef = useRef(sendToMaster)
   sendToMasterRef.current = sendToMaster
 
-  // ----- Start server on mount -----
+  // Start server on mount
   useEffect(() => {
     if (!enabled) return
 
@@ -84,15 +88,15 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
         }
         serverRef.current = server
 
-        // Update AppState with our pipe name
         setAppState((prev) => ({
           ...prev,
           pipeIpc: { ...prev.pipeIpc, serverName: pipeName },
         }))
 
         // Expose sendToMaster globally so REPL onQueryEvent can relay output
-        // without importing hooks (avoids circular deps and closure issues).
         ;(globalThis as any).__pipeSendToMaster = (msg: PipeMessage) => {
+          const currentState = store.getState()
+          if (currentState.pipeIpc.role !== 'slave') return
           const masterSocket = masterSocketRef.current
           if (server && masterSocket && !masterSocket.destroyed) {
             server.sendTo(masterSocket, msg)
@@ -109,30 +113,20 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
         })
 
         // --- Handle attach_request ---
-        server.on('connection', (socket: Socket) => {
-          logForDebugging(`[PipeIpc] New connection`)
-        })
-
         server.onMessage((msg, reply) => {
           if (msg.type === 'attach_request') {
             const currentState = store.getState()
 
             if (currentState.pipeIpc.role === 'slave') {
-              // Already attached by someone else
               reply({
                 type: 'attach_reject',
-                data: `Already attached by ${currentState.pipeIpc.attachedBy}`,
+                data: `Already controlled by ${currentState.pipeIpc.attachedBy}`,
               })
-              logForDebugging(`[PipeIpc] Rejected attach from ${msg.from}: already attached`)
+              logForDebugging(`[PipeIpc] Rejected attach from ${msg.from}: already slave`)
               return
             }
 
-            // Accept the attach
-            // We need to find the socket that sent this message.
-            // Since reply() writes to the correct socket, we use it.
-            // But we also need a reference to the socket for future sends.
-            // The server emits 'connection' with the socket, but we can't
-            // easily correlate. Instead, we iterate clients to find the newest.
+            // Accept the attach — find the latest client socket
             const clients = Array.from((server as any).clients as Set<Socket>)
             const latestClient = clients[clients.length - 1]
             if (latestClient) {
@@ -199,12 +193,10 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
 
             logForDebugging(`[PipeIpc] Received prompt from master: ${promptText.slice(0, 50)}...`)
 
-            // Wrap in XML tag (same pattern as useInboxPoller)
             const formatted = `<${PIPE_IPC_TAG} from="${msg.from ?? 'master'}">\n${promptText}\n</${PIPE_IPC_TAG}>`
 
             const submitted = onSubmitMessage(formatted)
             if (!submitted) {
-              // Session is busy — send error back to master
               sendToMasterRef.current({
                 type: 'error',
                 data: 'Slave CLI is busy processing another request. Please wait.',
@@ -232,7 +224,7 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
         pipeIpc: {
           role: 'standalone',
           serverName: null,
-          attachedTo: null,
+          slaves: {},
           attachedBy: null,
         },
       }))
@@ -241,17 +233,14 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
 }
 
 /**
- * Module-level ref for the sendToMaster function.
- * Used by REPL to relay AI output to the master CLI.
- *
- * This is set by the usePipeIpc hook when a master is attached.
+ * Relay a session event to the master CLI (if in slave mode).
+ * Called from REPL's onQueryEvent handler.
  */
-let _globalSendToMaster: ((msg: PipeMessage) => void) | null = null
-
-export function setGlobalPipeSendToMaster(fn: ((msg: PipeMessage) => void) | null): void {
-  _globalSendToMaster = fn
-}
-
-export function getGlobalPipeSendToMaster(): ((msg: PipeMessage) => void) | null {
-  return _globalSendToMaster
+export function relayToMaster(msg: PipeMessage): void {
+  const fn = (globalThis as any).__pipeSendToMaster as
+    | ((msg: PipeMessage) => void)
+    | undefined
+  if (fn) {
+    fn(msg)
+  }
 }

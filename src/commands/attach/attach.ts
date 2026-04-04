@@ -1,6 +1,6 @@
 import type { LocalCommandCall } from '../../types/command.js'
 import { connectToPipe, type PipeClient, type PipeMessage } from '../../utils/pipeTransport.js'
-import { setMasterPipeClient } from '../../hooks/useMasterRelay.js'
+import { addSlaveClient } from '../../hooks/useMasterMonitor.js'
 
 export const call: LocalCommandCall = async (args, context) => {
   const targetName = args.trim()
@@ -12,10 +12,20 @@ export const call: LocalCommandCall = async (args, context) => {
   }
 
   const currentState = context.getAppState()
-  if (currentState.pipeIpc.role === 'master') {
+
+  // Check if already attached to this slave
+  if (currentState.pipeIpc.slaves[targetName]) {
     return {
       type: 'text',
-      value: `Already attached to "${currentState.pipeIpc.attachedTo}". Use /detach first.`,
+      value: `Already attached to "${targetName}".`,
+    }
+  }
+
+  // Cannot attach when in slave mode
+  if (currentState.pipeIpc.role === 'slave') {
+    return {
+      type: 'text',
+      value: 'Cannot attach: this CLI is in slave mode. Use /detach from the master first.',
     }
   }
 
@@ -45,27 +55,35 @@ export const call: LocalCommandCall = async (args, context) => {
       if (msg.type === 'attach_accept') {
         clearTimeout(timeout)
 
-        // Store client reference at module level for useMasterRelay
-        setMasterPipeClient(client)
+        // Register the slave client in the module-level registry
+        addSlaveClient(targetName, client)
 
-        // Update AppState
+        // Update AppState: add slave and switch to master role
         context.setAppState((prev) => ({
           ...prev,
           pipeIpc: {
             ...prev.pipeIpc,
             role: 'master',
-            attachedTo: targetName,
+            slaves: {
+              ...prev.pipeIpc.slaves,
+              [targetName]: {
+                name: targetName,
+                connectedAt: new Date().toISOString(),
+                status: 'idle' as const,
+                history: [],
+              },
+            },
           },
         }))
 
+        const slaveCount = Object.keys(currentState.pipeIpc.slaves).length + 1
         resolve({
           type: 'text',
-          value: `Attached to "${targetName}". Your input will be forwarded to the remote CLI.\nUse /detach to return to local mode.`,
+          value: `Attached to "${targetName}" as master. Now monitoring ${slaveCount} slave(s).\nUse /send ${targetName} <message> to send tasks.\nUse /status to see all slaves.\nUse /detach ${targetName} to disconnect.`,
         })
       } else if (msg.type === 'attach_reject') {
         clearTimeout(timeout)
         client.disconnect()
-        setMasterPipeClient(null)
 
         resolve({
           type: 'text',

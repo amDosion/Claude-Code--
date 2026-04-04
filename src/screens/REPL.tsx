@@ -141,8 +141,8 @@ import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
 import { handlePromptSubmit, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
 import { useQueueProcessor } from '../hooks/useQueueProcessor.js';
 import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
-import { usePipeIpc } from '../hooks/usePipeIpc.js';
-import { useMasterRelay, getMasterPipeClient } from '../hooks/useMasterRelay.js';
+import { usePipeIpc, relayToMaster } from '../hooks/usePipeIpc.js';
+import { useMasterMonitor } from '../hooks/useMasterMonitor.js';
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
 import { query } from '../query.js';
@@ -1603,6 +1603,8 @@ export function REPL({
     // queryGuard.end() (onQuery finally) or cancelReservation() (executeUserInput
     // finally) have already transitioned the guard to idle by the time this runs.
     // External loading (remote/backgrounding) is reset separately by those hooks.
+    // Relay turn-complete to master (if in slave mode)
+    relayToMaster({ type: 'done' });
     setIsExternalLoading(false);
     setUserInputOnProcessing(undefined);
     responseLengthRef.current = 0;
@@ -2617,34 +2619,6 @@ export function REPL({
   });
   const onQueryEvent = useCallback((event: Parameters<typeof handleMessageFromStream>[0]) => {
     handleMessageFromStream(event, newMessage => {
-      // ── Slave-mode relay: stream AI output back to the attached master CLI ──
-      // When this CLI is in slave mode, forward assistant text to the master so
-      // it can display the response. Tool progress is also relayed as tool_start.
-      {
-        const pipeState = store.getState().pipeIpc;
-        if (pipeState.role === 'slave') {
-          const client = getMasterPipeClient(); // null on slave side — we use the server ref
-          // On slave side we don't have the master client, we use sendToMaster via broadcast
-          // which is exposed through the PipeServer. We import the helper from usePipeIpc.
-          const sendFn = (globalThis as any).__pipeSendToMaster as ((msg: import('../utils/pipeTransport.js').PipeMessage) => void) | undefined;
-          if (sendFn) {
-            if (newMessage.type === 'assistant') {
-              const content = newMessage.message?.content;
-              if (Array.isArray(content)) {
-                for (const block of content) {
-                  if (block.type === 'text' && block.text) {
-                    sendFn({ type: 'stream', data: block.text });
-                  }
-                }
-              } else if (typeof content === 'string' && content) {
-                sendFn({ type: 'stream', data: content });
-              }
-            } else if (newMessage.type === 'progress') {
-              sendFn({ type: 'tool_start', data: (newMessage as any).data?.content ?? '' });
-            }
-          }
-        }
-      }
       if (isCompactBoundaryMessage(newMessage)) {
         // Fullscreen: keep pre-compact messages for scrollback. query.ts
         // slices at the boundary for API calls, Messages.tsx skips the
@@ -2690,6 +2664,20 @@ export function REPL({
       } else {
         setMessages(oldMessages => [...oldMessages, newMessage]);
       }
+      // Relay tool and assistant events to master (if in slave mode)
+      if (newMessage.type === 'progress' && 'data' in newMessage) {
+        const progressType = (newMessage.data as any)?.type as string | undefined;
+        if (progressType === 'tool_start') {
+          relayToMaster({ type: 'tool_start', data: (newMessage.data as any)?.tool ?? '', meta: { toolUseId: (newMessage as any).parentToolUseID } });
+        } else if (progressType === 'tool_result') {
+          relayToMaster({ type: 'tool_result', data: String((newMessage.data as any)?.result ?? '').slice(0, 500), meta: { toolUseId: (newMessage as any).parentToolUseID } });
+        }
+      } else if (newMessage.type === 'assistant') {
+        const text = typeof (newMessage as any).content === 'string' ? (newMessage as any).content : '';
+        if (text) {
+          relayToMaster({ type: 'stream', data: text });
+        }
+      }
       // Block ticks on API errors to prevent tick → error → tick
       // runaway loops (e.g., auth failure, rate limit, blocking limit).
       // Cleared on compact boundary (above) or successful response (below).
@@ -2705,6 +2693,8 @@ export function REPL({
       // spinner animation) and apiMetricsRef (endResponseLength/lastTokenTime
       // for OTPS). No separate metrics update needed here.
       setResponseLength(length => length + newContent.length);
+      // Relay streaming text to master (if in slave mode)
+      relayToMaster({ type: 'stream', data: newContent });
     }, setStreamMode, setStreamingToolUses, tombstonedMessage => {
       setMessages(oldMessages => oldMessages.filter(m => m !== tombstonedMessage));
       void removeTranscriptMessage(tombstonedMessage.uuid);
@@ -2907,17 +2897,6 @@ export function REPL({
       })]);
     }
     resetLoadingState();
-
-    // ── Slave-mode: signal turn completion to the attached master CLI ──
-    {
-      const pipeState = store.getState().pipeIpc;
-      if (pipeState.role === 'slave') {
-        const sendFn = (globalThis as any).__pipeSendToMaster as ((msg: import('../utils/pipeTransport.js').PipeMessage) => void) | undefined;
-        if (sendFn) {
-          sendFn({ type: 'done' });
-        }
-      }
-    }
 
     // Log query profiling report if enabled
     logQueryProfileReport();
@@ -3222,26 +3201,6 @@ export function REPL({
     // Re-pin scroll to bottom on submit so the user always sees the new
     // exchange (matches OpenCode's auto-scroll behavior).
     repinScroll();
-
-    // ── Master-mode intercept: forward user input to slave CLI via pipe ──
-    // When attached as master, user input goes to the remote slave instead
-    // of the local AI — unless it's a slash command (/ prefix) which always
-    // runs locally (so /detach etc. still work).
-    if (!speculationAccept && !input.trim().startsWith('/')) {
-      const currentPipeState = store.getState().pipeIpc;
-      if (currentPipeState.role === 'master') {
-        const client = getMasterPipeClient();
-        if (client && client.connected) {
-          try {
-            client.send({ type: 'prompt', data: input.trim(), from: currentPipeState.serverName ?? undefined });
-          } catch {
-            // Socket closed — will be caught by disconnect handler
-          }
-          helpers.clearBuffer();
-          return;
-        }
-      }
-    }
 
     // Resume loop mode if paused
     if (feature('PROACTIVE') || feature('KAIROS')) {
@@ -4151,18 +4110,14 @@ export function REPL({
     onSubmitMessage: handleIncomingPrompt
   });
 
-  // Named pipe IPC for master-slave terminal bridge
+  // Pipe IPC: every CLI auto-starts a PipeServer for inter-terminal communication
   usePipeIpc({
     enabled: true,
     isLoading,
     onSubmitMessage: handleIncomingPrompt,
   });
-  const pipeIpcRole = useAppState(s => s.pipeIpc.role);
-  useMasterRelay({
-    enabled: pipeIpcRole === 'master',
-    masterClient: getMasterPipeClient(),
-    onSubmitMessage: handleIncomingPrompt,
-  });
+  // Master monitor: receives session data from connected slaves
+  useMasterMonitor();
 
   // Scheduled tasks from .claude/scheduled_tasks.json (CronCreate/Delete/List)
   if (feature('AGENT_TRIGGERS')) {

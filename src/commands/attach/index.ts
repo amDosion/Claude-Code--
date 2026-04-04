@@ -3,7 +3,7 @@ import type { Command } from '../../commands.js'
 const attach = {
   type: 'local',
   name: 'attach',
-  description: 'Attach to another CLI terminal as master (forward input to remote slave)',
+  description: 'Attach to a slave CLI to monitor and control it',
   argumentHint: '<pipe-name>',
   supportsNonInteractive: false,
   load: () => import('./attach.js'),

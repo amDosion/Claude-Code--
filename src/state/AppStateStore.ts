@@ -86,6 +86,34 @@ export type FooterItem =
   | 'bridge'
   | 'companion'
 
+// ---------------------------------------------------------------------------
+// Pipe IPC types (master-slave CLI communication)
+// ---------------------------------------------------------------------------
+
+export type SessionEntry = {
+  type: 'prompt' | 'stream' | 'tool_start' | 'tool_result' | 'done' | 'error'
+  content: string
+  from: string
+  timestamp: string
+  meta?: Record<string, unknown>
+}
+
+export type SlaveInfo = {
+  name: string
+  connectedAt: string
+  status: 'connected' | 'busy' | 'idle'
+  history: SessionEntry[]
+}
+
+export type PipeIpcState = {
+  role: 'standalone' | 'master' | 'slave'
+  serverName: string | null
+  // Master-specific: connected slaves
+  slaves: Record<string, SlaveInfo>
+  // Slave-specific: which master controls us
+  attachedBy: string | null
+}
+
 export type AppState = DeepImmutable<{
   settings: SettingsJson
   verbose: boolean
@@ -417,17 +445,6 @@ export type AppState = DeepImmutable<{
   }
   // Denial tracking for classifier modes (YOLO, headless, etc.) - falls back to prompting when limits exceeded
   denialTracking?: DenialTrackingState
-  // Named pipe IPC state for master-slave terminal bridge
-  pipeIpc: {
-    /** Current role: standalone (default), master (attached to slave), slave (being controlled) */
-    role: 'standalone' | 'master' | 'slave'
-    /** This CLI's pipe server name (auto-assigned on startup) */
-    serverName: string | null
-    /** Master mode: the slave pipe we're attached to */
-    attachedTo: string | null
-    /** Slave mode: who attached to us */
-    attachedBy: string | null
-  }
   // Active overlays (Select dialogs, etc.) for Escape key coordination
   activeOverlays: ReadonlySet<string>
   // Fast mode
@@ -460,6 +477,8 @@ export type AppState = DeepImmutable<{
   // Races against local UI + bridge + hooks + classifier via claim() in
   // interactiveHandler.ts. Constructed once in useManageMCPConnections.
   channelPermissionCallbacks?: ChannelPermissionCallbacks
+  // Pipe IPC: master-slave CLI communication
+  pipeIpc: PipeIpcState
 }
 
 export type AppStateStore = Store<AppState>
@@ -574,13 +593,13 @@ export function getDefaultAppState(): AppState {
     authVersion: 0,
     initialMessage: null,
     effortValue: undefined,
+    activeOverlays: new Set<string>(),
+    fastMode: false,
     pipeIpc: {
       role: 'standalone',
       serverName: null,
-      attachedTo: null,
+      slaves: {},
       attachedBy: null,
     },
-    activeOverlays: new Set<string>(),
-    fastMode: false,
   }
 }
