@@ -44,6 +44,9 @@ import skills from './commands/skills/index.js'
 import status from './commands/status/index.js'
 import tasks from './commands/tasks/index.js'
 import teleport from './commands/teleport/index.js'
+import attach from './commands/attach/index.js'
+import detach from './commands/detach/index.js'
+import pipes from './commands/pipes/index.js'
 /* eslint-disable @typescript-eslint/no-require-imports */
 const agentsPlatform =
   process.env.USER_TYPE === 'ant'
@@ -338,6 +341,9 @@ const COMMANDS = memoize((): Command[] => [
   passes,
   ...(peersCmd ? [peersCmd] : []),
   tasks,
+  attach,
+  detach,
+  pipes,
   ...(workflowsCmd ? [workflowsCmd] : []),
   ...(torch ? [torch] : []),
   ...(process.env.USER_TYPE === 'ant' && !process.env.IS_DEMO

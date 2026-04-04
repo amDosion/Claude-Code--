@@ -1,25 +1,15 @@
 /**
- * Named Pipe Transport - Unix domain socket IPC for independent CLI terminals
+ * Named Pipe Transport - Unix domain socket IPC for CLI terminals
  *
- * Allows two independent Claude Code terminal instances to communicate
- * directly via Unix domain sockets (Linux/Mac) or named pipes (Windows).
+ * Supports two modes:
+ * 1. Standalone: Two independent terminals chat via pipes
+ * 2. Master-Slave bridge: Master CLI attaches to Slave CLI, forwarding
+ *    prompts and receiving streamed AI output back.
  *
- * Architecture:
- *   Terminal A (server)  <──── Unix Socket ────>  Terminal B (client)
- *
- * Each terminal registers a named pipe at:
- *   ~/.claude/pipes/{name}.sock
+ * Each CLI auto-creates a PipeServer at:
+ *   ~/.claude/pipes/{session-short-id}.sock
  *
  * Protocol: newline-delimited JSON (NDJSON), one message per line.
- *
- * Usage:
- *   // Terminal A: start listening
- *   const server = await createPipeServer('repl-a')
- *   server.onMessage((msg) => console.log(msg))
- *
- *   // Terminal B: connect and send
- *   const client = await connectToPipe('repl-a')
- *   client.send({ type: 'chat', data: 'hello from B' })
  */
 
 import { createServer, createConnection, type Server, type Socket } from 'net'
@@ -35,18 +25,51 @@ import { logError } from './log.js'
 
 /**
  * Message types exchanged over the pipe.
+ *
+ * Basic:        ping, pong
+ * Control:      attach_request, attach_accept, attach_reject, detach
+ * Data (M→S):   prompt           — master sends user input to slave
+ * Data (S→M):   stream           — slave streams AI output fragments
+ *               tool_start       — slave notifies tool execution start
+ *               tool_result      — slave notifies tool result
+ *               done             — slave signals turn complete
+ *               error            — either side reports an error
+ * Legacy:       chat, cmd, result, exit  — kept for pipe-demo.ts compat
  */
-export type PipeMessageType = 'chat' | 'cmd' | 'result' | 'exit' | 'ping' | 'pong'
+export type PipeMessageType =
+  // Basic
+  | 'ping'
+  | 'pong'
+  // Control flow (master-slave bridge)
+  | 'attach_request'
+  | 'attach_accept'
+  | 'attach_reject'
+  | 'detach'
+  // Data flow (master → slave)
+  | 'prompt'
+  // Data flow (slave → master)
+  | 'stream'
+  | 'tool_start'
+  | 'tool_result'
+  | 'done'
+  | 'error'
+  // Legacy (standalone chat demo)
+  | 'chat'
+  | 'cmd'
+  | 'result'
+  | 'exit'
 
 export type PipeMessage = {
   /** Discriminator */
   type: PipeMessageType
-  /** Payload (text, command output, etc.) */
+  /** Payload (text, command output, prompt, stream fragment, etc.) */
   data?: string
   /** Sender pipe name */
   from?: string
   /** ISO timestamp */
   ts?: string
+  /** Additional metadata (tool name, error details, etc.) */
+  meta?: Record<string, unknown>
 }
 
 export type PipeMessageHandler = (msg: PipeMessage, reply: (msg: PipeMessage) => void) => void
@@ -61,8 +84,6 @@ function getPipesDir(): string {
 
 export function getPipePath(name: string): string {
   const safeName = name.replace(/[^a-zA-Z0-9_-]/g, '_')
-  // On Windows, Node `net` treats paths starting with \\?\pipe\ as named pipes.
-  // On Unix, we use a plain socket file path.
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\claude-code-${safeName}`
   }
@@ -115,7 +136,6 @@ export class PipeServer extends EventEmitter {
         socket.on('data', (chunk) => {
           buffer += chunk.toString()
           const lines = buffer.split('\n')
-          // Keep the incomplete last chunk in the buffer
           buffer = lines.pop() ?? ''
 
           for (const line of lines) {
@@ -123,11 +143,12 @@ export class PipeServer extends EventEmitter {
             try {
               const msg = JSON.parse(line) as PipeMessage
               this.emit('message', msg)
-              // Call registered handlers with a reply function
               const reply = (replyMsg: PipeMessage) => {
                 replyMsg.from = replyMsg.from ?? this.name
                 replyMsg.ts = replyMsg.ts ?? new Date().toISOString()
-                socket.write(JSON.stringify(replyMsg) + '\n')
+                if (!socket.destroyed) {
+                  socket.write(JSON.stringify(replyMsg) + '\n')
+                }
               }
               for (const handler of this.handlers) {
                 handler(msg, reply)
@@ -179,15 +200,20 @@ export class PipeServer extends EventEmitter {
   }
 
   /**
-   * Number of connected clients.
+   * Send to a specific socket (used for directed replies in attach flow).
    */
+  sendTo(socket: Socket, msg: PipeMessage): void {
+    msg.from = msg.from ?? this.name
+    msg.ts = msg.ts ?? new Date().toISOString()
+    if (!socket.destroyed) {
+      socket.write(JSON.stringify(msg) + '\n')
+    }
+  }
+
   get connectionCount(): number {
     return this.clients.size
   }
 
-  /**
-   * Stop listening and close all connections.
-   */
   async close(): Promise<void> {
     for (const client of this.clients) {
       client.destroy()
@@ -201,7 +227,6 @@ export class PipeServer extends EventEmitter {
       }
       this.server.close(() => {
         this.server = null
-        // Clean up socket file
         if (process.platform !== 'win32') {
           void unlink(this.socketPath).catch(() => {})
         }
@@ -231,8 +256,7 @@ export class PipeClient extends EventEmitter {
 
   /**
    * Connect to a remote pipe server.
-   * Retries automatically if the socket file doesn't exist yet (ENOENT),
-   * which is common when the server is still starting up.
+   * Retries automatically if the socket file doesn't exist yet (ENOENT).
    */
   async connect(timeoutMs: number = 5000): Promise<void> {
     const { access } = await import('fs/promises')
@@ -256,7 +280,6 @@ export class PipeClient extends EventEmitter {
       }
     }
 
-    // Now connect
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error(`Connection to pipe "${this.targetName}" timed out after ${timeoutMs}ms`))
@@ -310,16 +333,10 @@ export class PipeClient extends EventEmitter {
     })
   }
 
-  /**
-   * Register a handler for incoming messages.
-   */
   onMessage(handler: PipeMessageHandler): void {
     this.handlers.push(handler)
   }
 
-  /**
-   * Send a message to the server.
-   */
   send(msg: PipeMessage): void {
     if (!this.socket || this.socket.destroyed) {
       throw new Error(`Not connected to pipe "${this.targetName}"`)
@@ -329,9 +346,6 @@ export class PipeClient extends EventEmitter {
     this.socket.write(JSON.stringify(msg) + '\n')
   }
 
-  /**
-   * Disconnect from the server.
-   */
   disconnect(): void {
     if (this.socket) {
       this.socket.destroy()
@@ -348,34 +362,12 @@ export class PipeClient extends EventEmitter {
 // Convenience factory functions
 // ---------------------------------------------------------------------------
 
-/**
- * Create and start a pipe server with the given name.
- *
- * @example
- *   const server = await createPipeServer('terminal-a')
- *   server.onMessage((msg, reply) => {
- *     console.log(`[${msg.from}] ${msg.data}`)
- *     if (msg.type === 'cmd') {
- *       reply({ type: 'result', data: 'command output here' })
- *     }
- *   })
- */
 export async function createPipeServer(name: string): Promise<PipeServer> {
   const server = new PipeServer(name)
   await server.start()
   return server
 }
 
-/**
- * Connect to an existing pipe server.
- *
- * @example
- *   const client = await connectToPipe('terminal-a', 'terminal-b')
- *   client.send({ type: 'chat', data: 'hello!' })
- *   client.onMessage((msg) => {
- *     console.log(`Reply: ${msg.data}`)
- *   })
- */
 export async function connectToPipe(
   targetName: string,
   senderName?: string,
@@ -388,7 +380,6 @@ export async function connectToPipe(
 
 /**
  * List all active pipe names (by scanning the pipes directory).
- * Note: a socket file existing doesn't guarantee the server is still running.
  */
 export async function listPipes(): Promise<string[]> {
   try {
@@ -404,7 +395,6 @@ export async function listPipes(): Promise<string[]> {
 
 /**
  * Probe whether a pipe server is alive by sending a ping.
- * Returns true if a pong is received within timeoutMs.
  */
 export async function isPipeAlive(name: string, timeoutMs: number = 2000): Promise<boolean> {
   try {

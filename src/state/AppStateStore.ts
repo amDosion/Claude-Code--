@@ -417,6 +417,17 @@ export type AppState = DeepImmutable<{
   }
   // Denial tracking for classifier modes (YOLO, headless, etc.) - falls back to prompting when limits exceeded
   denialTracking?: DenialTrackingState
+  // Named pipe IPC state for master-slave terminal bridge
+  pipeIpc: {
+    /** Current role: standalone (default), master (attached to slave), slave (being controlled) */
+    role: 'standalone' | 'master' | 'slave'
+    /** This CLI's pipe server name (auto-assigned on startup) */
+    serverName: string | null
+    /** Master mode: the slave pipe we're attached to */
+    attachedTo: string | null
+    /** Slave mode: who attached to us */
+    attachedBy: string | null
+  }
   // Active overlays (Select dialogs, etc.) for Escape key coordination
   activeOverlays: ReadonlySet<string>
   // Fast mode
@@ -563,6 +574,12 @@ export function getDefaultAppState(): AppState {
     authVersion: 0,
     initialMessage: null,
     effortValue: undefined,
+    pipeIpc: {
+      role: 'standalone',
+      serverName: null,
+      attachedTo: null,
+      attachedBy: null,
+    },
     activeOverlays: new Set<string>(),
     fastMode: false,
   }

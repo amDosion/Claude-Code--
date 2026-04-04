@@ -141,6 +141,8 @@ import { gracefulShutdownSync } from '../utils/gracefulShutdown.js';
 import { handlePromptSubmit, type PromptInputHelpers } from '../utils/handlePromptSubmit.js';
 import { useQueueProcessor } from '../hooks/useQueueProcessor.js';
 import { useMailboxBridge } from '../hooks/useMailboxBridge.js';
+import { usePipeIpc } from '../hooks/usePipeIpc.js';
+import { useMasterRelay, getMasterPipeClient } from '../hooks/useMasterRelay.js';
 import { queryCheckpoint, logQueryProfileReport } from '../utils/queryProfiler.js';
 import type { Message as MessageType, UserMessage, ProgressMessage, HookResultMessage, PartialCompactDirection } from '../types/message.js';
 import { query } from '../query.js';
@@ -4088,6 +4090,19 @@ export function REPL({
   useMailboxBridge({
     isLoading,
     onSubmitMessage: handleIncomingPrompt
+  });
+
+  // Named pipe IPC for master-slave terminal bridge
+  usePipeIpc({
+    enabled: true,
+    isLoading,
+    onSubmitMessage: handleIncomingPrompt,
+  });
+  const pipeIpcRole = useAppState(s => s.pipeIpc.role);
+  useMasterRelay({
+    enabled: pipeIpcRole === 'master',
+    masterClient: getMasterPipeClient(),
+    onSubmitMessage: handleIncomingPrompt,
   });
 
   // Scheduled tasks from .claude/scheduled_tasks.json (CronCreate/Delete/List)
