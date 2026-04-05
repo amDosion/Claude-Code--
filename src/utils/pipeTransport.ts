@@ -34,7 +34,7 @@ import { logError } from './log.js'
  *               tool_result      — slave notifies tool result
  *               done             — slave signals turn complete
  *               error            — either side reports an error
- * Legacy:       chat, cmd, result, exit  — kept for pipe-demo.ts compat
+ * Legacy:       chat, cmd, result, exit  — kept for backward compat
  */
 export type PipeMessageType =
   // Basic
@@ -420,4 +420,37 @@ export async function isPipeAlive(name: string, timeoutMs: number = 2000): Promi
   } catch {
     return false
   }
+}
+
+// ─── PipeIpc AppState extension ──────────────────────────────────────
+// AppState.pipeIpc is added at runtime when feature('PIPE_IPC') is on.
+// These types and the default accessor ensure safe access from hooks
+// and commands without modifying the original AppStateStore.
+
+export type PipeIpcSlaveState = {
+  client: PipeClient | null
+  history: Array<{ type: string; content: string; from: string; timestamp: string; meta?: Record<string, unknown> }>
+}
+
+export type PipeIpcState = {
+  role: 'standalone' | 'master' | 'slave'
+  serverName: string | null
+  attachedBy: string | null
+  slaves: Record<string, PipeIpcSlaveState>
+}
+
+const DEFAULT_PIPE_IPC: PipeIpcState = {
+  role: 'standalone',
+  serverName: null,
+  attachedBy: null,
+  slaves: {},
+}
+
+/**
+ * Safely read pipeIpc from AppState, returning the default if not yet initialized.
+ * This avoids crashes when the state hasn't been extended by the PIPE_IPC bootstrap.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function getPipeIpc(state: any): PipeIpcState {
+  return state?.pipeIpc ?? DEFAULT_PIPE_IPC
 }

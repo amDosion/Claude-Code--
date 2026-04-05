@@ -1,5 +1,5 @@
 import type { LocalCommandCall } from '../../types/command.js'
-import { connectToPipe, type PipeClient, type PipeMessage } from '../../utils/pipeTransport.js'
+import { connectToPipe, getPipeIpc, type PipeClient, type PipeMessage } from '../../utils/pipeTransport.js'
 import { addSlaveClient } from '../../hooks/useMasterMonitor.js'
 
 export const call: LocalCommandCall = async (args, context) => {
@@ -14,7 +14,7 @@ export const call: LocalCommandCall = async (args, context) => {
   const currentState = context.getAppState()
 
   // Check if already attached to this slave
-  if (currentState.pipeIpc.slaves[targetName]) {
+  if (getPipeIpc(currentState).slaves[targetName]) {
     return {
       type: 'text',
       value: `Already attached to "${targetName}".`,
@@ -22,7 +22,7 @@ export const call: LocalCommandCall = async (args, context) => {
   }
 
   // Cannot attach when in slave mode
-  if (currentState.pipeIpc.role === 'slave') {
+  if (getPipeIpc(currentState).role === 'slave') {
     return {
       type: 'text',
       value: 'Cannot attach: this CLI is in slave mode. Use /detach from the master first.',
@@ -32,7 +32,7 @@ export const call: LocalCommandCall = async (args, context) => {
   // Connect to the target pipe server
   let client: PipeClient
   try {
-    const myName = currentState.pipeIpc.serverName ?? `master-${process.pid}`
+    const myName = getPipeIpc(currentState).serverName ?? `master-${process.pid}`
     client = await connectToPipe(targetName, myName)
   } catch (err) {
     return {
@@ -62,10 +62,10 @@ export const call: LocalCommandCall = async (args, context) => {
         context.setAppState((prev) => ({
           ...prev,
           pipeIpc: {
-            ...prev.pipeIpc,
+            ...getPipeIpc(prev),
             role: 'master',
             slaves: {
-              ...prev.pipeIpc.slaves,
+              ...getPipeIpc(prev).slaves,
               [targetName]: {
                 name: targetName,
                 connectedAt: new Date().toISOString(),
@@ -76,7 +76,7 @@ export const call: LocalCommandCall = async (args, context) => {
           },
         }))
 
-        const slaveCount = Object.keys(currentState.pipeIpc.slaves).length + 1
+        const slaveCount = Object.keys(getPipeIpc(currentState).slaves).length + 1
         resolve({
           type: 'text',
           value: `Attached to "${targetName}" as master. Now monitoring ${slaveCount} slave(s).\nUse /send ${targetName} <message> to send tasks.\nUse /status to see all slaves.\nUse /detach ${targetName} to disconnect.`,

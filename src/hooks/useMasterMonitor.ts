@@ -11,9 +11,17 @@
 
 import { useEffect } from 'react'
 import { useAppState, useSetAppState } from '../state/AppState.js'
-import type { PipeClient, PipeMessage } from '../utils/pipeTransport.js'
-import type { SessionEntry } from '../state/AppStateStore.js'
+import { getPipeIpc, type PipeClient, type PipeMessage } from '../utils/pipeTransport.js'
 import { logForDebugging } from '../utils/debug.js'
+
+/** Session history entry for pipe IPC monitoring. */
+export type SessionEntry = {
+  type: string
+  content: string
+  from: string
+  timestamp: string
+  meta?: Record<string, unknown>
+}
 
 /**
  * Module-level registry of connected slave PipeClients.
@@ -40,7 +48,7 @@ export function getAllSlaveClients(): Map<string, PipeClient> {
 }
 
 export function useMasterMonitor(): void {
-  const role = useAppState((s) => s.pipeIpc.role)
+  const role = useAppState((s) => getPipeIpc(s).role)
   const setAppState = useSetAppState()
 
   useEffect(() => {
@@ -65,7 +73,7 @@ export function useMasterMonitor(): void {
         }
 
         setAppState((prev) => {
-          const slave = prev.pipeIpc.slaves[slaveName]
+          const slave = getPipeIpc(prev).slaves[slaveName]
           if (!slave) return prev
 
           const newStatus =
@@ -75,9 +83,9 @@ export function useMasterMonitor(): void {
           return {
             ...prev,
             pipeIpc: {
-              ...prev.pipeIpc,
+              ...getPipeIpc(prev),
               slaves: {
-                ...prev.pipeIpc.slaves,
+                ...getPipeIpc(prev).slaves,
                 [slaveName]: {
                   ...slave,
                   status: newStatus,
@@ -100,12 +108,12 @@ export function useMasterMonitor(): void {
         logForDebugging(`[MasterMonitor] Slave "${slaveName}" disconnected`)
         _slaveClients.delete(slaveName)
         setAppState((prev) => {
-          const { [slaveName]: _removed, ...remainingSlaves } = prev.pipeIpc.slaves
+          const { [slaveName]: _removed, ...remainingSlaves } = getPipeIpc(prev).slaves
           const hasSlaves = Object.keys(remainingSlaves).length > 0
           return {
             ...prev,
             pipeIpc: {
-              ...prev.pipeIpc,
+              ...getPipeIpc(prev),
               role: hasSlaves ? 'master' : 'standalone',
               slaves: remainingSlaves,
             },

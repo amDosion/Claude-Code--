@@ -1,10 +1,10 @@
 import type { LocalCommandCall } from '../../types/command.js'
-import { listPipes, isPipeAlive } from '../../utils/pipeTransport.js'
+import { listPipes, isPipeAlive, getPipeIpc } from '../../utils/pipeTransport.js'
 
 export const call: LocalCommandCall = async (_args, context) => {
   const currentState = context.getAppState()
-  const myName = currentState.pipeIpc.serverName
-  const role = currentState.pipeIpc.role
+  const myName = getPipeIpc(currentState).serverName
+  const role = getPipeIpc(currentState).role
 
   const allPipes = await listPipes()
 
@@ -15,10 +15,10 @@ export const call: LocalCommandCall = async (_args, context) => {
   lines.push(`Role:       ${role}`)
 
   if (role === 'master') {
-    const slaveNames = Object.keys(currentState.pipeIpc.slaves)
+    const slaveNames = Object.keys(getPipeIpc(currentState).slaves)
     lines.push(`Slaves (${slaveNames.length}): ${slaveNames.join(', ') || 'none'}`)
   } else if (role === 'slave') {
-    lines.push(`Controlled by: ${currentState.pipeIpc.attachedBy}`)
+    lines.push(`Controlled by: ${getPipeIpc(currentState).attachedBy}`)
   }
 
   lines.push('')
@@ -32,7 +32,7 @@ export const call: LocalCommandCall = async (_args, context) => {
     for (const name of otherPipes) {
       const alive = await isPipeAlive(name)
       const status = alive ? 'alive' : 'stale'
-      const isAttached = currentState.pipeIpc.slaves[name] ? ' [attached]' : ''
+      const isAttached = getPipeIpc(currentState).slaves[name] ? ' [attached]' : ''
       lines.push(`  ${name}  [${status}]${isAttached}`)
     }
   }
