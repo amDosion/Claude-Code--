@@ -117,9 +117,10 @@ export function useMasterRelay({
       }
     }
 
-    masterClient.onMessage(handler)
+    const unsubscribe = masterClient.onMessage(handler)
 
     return () => {
+      unsubscribe()
       streamBuffer = ''
       boundClientRef.current = null
     }

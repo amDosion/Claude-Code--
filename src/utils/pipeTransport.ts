@@ -181,8 +181,11 @@ export class PipeServer extends EventEmitter {
   /**
    * Register a handler for incoming messages.
    */
-  onMessage(handler: PipeMessageHandler): void {
+  onMessage(handler: PipeMessageHandler): () => void {
     this.handlers.push(handler)
+    return () => {
+      this.handlers = this.handlers.filter((h) => h !== handler)
+    }
   }
 
   /**
@@ -333,8 +336,11 @@ export class PipeClient extends EventEmitter {
     })
   }
 
-  onMessage(handler: PipeMessageHandler): void {
+  onMessage(handler: PipeMessageHandler): () => void {
     this.handlers.push(handler)
+    return () => {
+      this.handlers = this.handlers.filter((h) => h !== handler)
+    }
   }
 
   send(msg: PipeMessage): void {
