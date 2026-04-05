@@ -26,6 +26,15 @@ export type LocalWorkflowTaskState = TaskStateBase & {
   agentId?: AgentId
   /** Abort controller for cancellation. */
   abortController?: AbortController
+  /**
+   * Pending action for a sub-agent within this workflow.
+   * The workflow execution loop polls this field and acts on it.
+   */
+  pendingAgentAction?: {
+    kind: 'skip' | 'retry'
+    agentId: AgentId
+    requestedAt: number
+  }
 }
 
 export function isLocalWorkflowTask(
@@ -128,12 +137,13 @@ export function skipWorkflowAgent(
   )
   updateTaskState<LocalWorkflowTaskState>(taskId, setAppState, task => {
     if (task.status !== 'running') return task
-    // The agent skip is communicated via a state update; the workflow
-    // runner polls this flag and advances to the next step.
     return {
       ...task,
-      // Signal the workflow runner to skip the current agent step.
-      // The actual abort is handled by the workflow execution loop.
+      pendingAgentAction: {
+        kind: 'skip',
+        agentId,
+        requestedAt: Date.now(),
+      },
     }
   })
 }
@@ -155,7 +165,11 @@ export function retryWorkflowAgent(
     if (task.status !== 'running') return task
     return {
       ...task,
-      // Signal the workflow runner to retry the current agent step.
+      pendingAgentAction: {
+        kind: 'retry',
+        agentId,
+        requestedAt: Date.now(),
+      },
     }
   })
 }

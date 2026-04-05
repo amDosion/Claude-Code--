@@ -74,13 +74,14 @@ The REPL runs in a VM context with tool APIs available as functions. Results fro
     }
   },
 
-  async call(input: REPLInput) {
+  async call(_input: REPLInput) {
     // REPL execution engine is provided by the ant-native runtime.
     // This stub satisfies the tool interface; the actual VM dispatch
-    // is wired in the ant build.
+    // is wired in the ant build. Without the ant runtime, REPL is
+    // not available and callers should be informed.
     return {
       data: {
-        result: `REPL executed: ${input.code.slice(0, 200)}`,
+        result: 'Error: REPL tool is not available in this build. The REPL execution engine requires the ant-native runtime.',
         tool_calls: 0,
       },
     }
