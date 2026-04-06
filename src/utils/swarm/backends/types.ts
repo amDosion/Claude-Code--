@@ -4,15 +4,16 @@ import type { AgentColorName } from '../../../tools/AgentTool/agentColorManager.
  * Types of backends available for teammate execution.
  * - 'tmux': Uses tmux for pane management (works in tmux or standalone)
  * - 'iterm2': Uses iTerm2 native split panes via the it2 CLI
+ * - 'windows-terminal': Uses Windows Terminal native split panes via wt.exe
  * - 'in-process': Runs teammate in the same Node.js process with isolated context
  */
-export type BackendType = 'tmux' | 'iterm2' | 'in-process'
+export type BackendType = 'tmux' | 'iterm2' | 'windows-terminal' | 'in-process'
 
 /**
  * Subset of BackendType for pane-based backends only.
  * Used in messages and types that specifically deal with terminal panes.
  */
-export type PaneBackendType = 'tmux' | 'iterm2'
+export type PaneBackendType = 'tmux' | 'iterm2' | 'windows-terminal'
 
 /**
  * Opaque identifier for a pane managed by a backend.
@@ -222,6 +223,23 @@ export type TeammateSpawnConfig = TeammateIdentity & {
   /** Whether this teammate can show permission prompts for unlisted tools.
    * When false (default), unlisted tools are auto-denied. */
   allowPermissionPrompts?: boolean
+
+  /**
+   * Custom command to execute in the pane instead of the default Claude binary.
+   * When set, this command is used directly and teammate identity flags are NOT appended.
+   * This enables launching arbitrary CLI tools (e.g., cldex, gemini, custom scripts)
+   * in split panes.
+   *
+   * The command string is passed to the shell as-is.
+   * Example: "gemini --interactive" or "python my_agent.py"
+   */
+  customCommand?: string
+
+  /**
+   * If true, skip writing to the teammate mailbox after spawn.
+   * Useful when spawning non-Claude processes that don't use the mailbox system.
+   */
+  skipMailbox?: boolean
 }
 
 /**
@@ -306,6 +324,8 @@ export type TeammateExecutor = {
 /**
  * Type guard to check if a backend type uses terminal panes.
  */
-export function isPaneBackend(type: BackendType): type is 'tmux' | 'iterm2' {
-  return type === 'tmux' || type === 'iterm2'
+export function isPaneBackend(
+  type: BackendType,
+): type is 'tmux' | 'iterm2' | 'windows-terminal' {
+  return type === 'tmux' || type === 'iterm2' || type === 'windows-terminal'
 }

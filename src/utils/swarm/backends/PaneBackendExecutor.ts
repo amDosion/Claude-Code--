@@ -110,48 +110,57 @@ export class PaneBackendExecutor implements TeammateExecutor {
         await this.backend.enablePaneBorderStatus()
       }
 
-      // Build the command to spawn Claude Code with teammate identity
-      const binaryPath = getTeammateCommand()
-
-      // Build teammate identity CLI args
-      const teammateArgs = [
-        `--agent-id ${quote([agentId])}`,
-        `--agent-name ${quote([config.name])}`,
-        `--team-name ${quote([config.teamName])}`,
-        `--agent-color ${quote([teammateColor])}`,
-        `--parent-session-id ${quote([config.parentSessionId || getSessionId()])}`,
-        config.planModeRequired ? '--plan-mode-required' : '',
-      ]
-        .filter(Boolean)
-        .join(' ')
-
-      // Build CLI flags to propagate to teammate
-      const appState = this.context.getAppState()
-      let inheritedFlags = buildInheritedCliFlags({
-        planModeRequired: config.planModeRequired,
-        permissionMode: appState.toolPermissionContext.mode,
-      })
-
-      // If teammate has a custom model, add --model flag (or replace inherited one)
-      if (config.model) {
-        inheritedFlags = inheritedFlags
-          .split(' ')
-          .filter(
-            (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
-          )
-          .join(' ')
-        inheritedFlags = inheritedFlags
-          ? `${inheritedFlags} --model ${quote([config.model])}`
-          : `--model ${quote([config.model])}`
-      }
-
-      const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+      // Build the spawn command
+      let spawnCommand: string
       const workingDir = config.cwd
 
-      // Build environment variables to forward to teammate
-      const envStr = buildInheritedEnvVars()
+      if (config.customCommand) {
+        // Custom command mode: use the provided command directly
+        // No teammate identity flags or inherited env vars are appended
+        spawnCommand = `cd ${quote([workingDir])} && ${config.customCommand}`
+      } else {
+        // Default mode: spawn Claude Code with teammate identity
+        const binaryPath = getTeammateCommand()
 
-      const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+        // Build teammate identity CLI args
+        const teammateArgs = [
+          `--agent-id ${quote([agentId])}`,
+          `--agent-name ${quote([config.name])}`,
+          `--team-name ${quote([config.teamName])}`,
+          `--agent-color ${quote([teammateColor])}`,
+          `--parent-session-id ${quote([config.parentSessionId || getSessionId()])}`,
+          config.planModeRequired ? '--plan-mode-required' : '',
+        ]
+          .filter(Boolean)
+          .join(' ')
+
+        // Build CLI flags to propagate to teammate
+        const appState = this.context.getAppState()
+        let inheritedFlags = buildInheritedCliFlags({
+          planModeRequired: config.planModeRequired,
+          permissionMode: appState.toolPermissionContext.mode,
+        })
+
+        // If teammate has a custom model, add --model flag (or replace inherited one)
+        if (config.model) {
+          inheritedFlags = inheritedFlags
+            .split(' ')
+            .filter(
+              (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
+            )
+            .join(' ')
+          inheritedFlags = inheritedFlags
+            ? `${inheritedFlags} --model ${quote([config.model])}`
+            : `--model ${quote([config.model])}`
+        }
+
+        const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+
+        // Build environment variables to forward to teammate
+        const envStr = buildInheritedEnvVars()
+
+        spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
+      }
 
       // Send the command to the new pane
       // Use swarm socket when running outside tmux (external swarm session)
@@ -175,15 +184,18 @@ export class PaneBackendExecutor implements TeammateExecutor {
       }
 
       // Send initial instructions to teammate via mailbox
-      await writeToMailbox(
-        config.name,
-        {
-          from: 'team-lead',
-          text: config.prompt,
-          timestamp: new Date().toISOString(),
-        },
-        config.teamName,
-      )
+      // Skip for custom commands that don't use the Claude mailbox system
+      if (!config.skipMailbox) {
+        await writeToMailbox(
+          config.name,
+          {
+            from: 'team-lead',
+            text: config.prompt,
+            timestamp: new Date().toISOString(),
+          },
+          config.teamName,
+        )
+      }
 
       logForDebugging(
         `[PaneBackendExecutor] Spawned teammate ${agentId} in pane ${paneId}`,

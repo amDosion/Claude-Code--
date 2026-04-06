@@ -3,10 +3,12 @@ import { logForDebugging } from '../../../utils/debug.js'
 import { getPlatform } from '../../../utils/platform.js'
 import {
   isInITerm2,
+  isInWindowsTerminal,
   isInsideTmux,
   isInsideTmuxSync,
   isIt2CliAvailable,
   isTmuxAvailable,
+  isWtCliAvailable,
 } from './detection.js'
 import { createInProcessBackend } from './InProcessBackend.js'
 import { getPreferTmuxOverIterm2 } from './it2Setup.js'
@@ -66,6 +68,12 @@ let TmuxBackendClass: (new () => PaneBackend) | null = null
 let ITermBackendClass: (new () => PaneBackend) | null = null
 
 /**
+ * Placeholder for WindowsTerminalBackend - will be replaced with actual implementation.
+ * This allows the registry to compile before the backend implementations exist.
+ */
+let WindowsTerminalBackendClass: (new () => PaneBackend) | null = null
+
+/**
  * Ensures backend classes are dynamically imported so getBackendByType() can
  * construct them. Unlike detectAndGetBackend(), this never spawns subprocesses
  * and never throws — it's the lightweight option when you only need class
@@ -75,6 +83,7 @@ export async function ensureBackendsRegistered(): Promise<void> {
   if (backendsRegistered) return
   await import('./TmuxBackend.js')
   await import('./ITermBackend.js')
+  await import('./WindowsTerminalBackend.js')
   backendsRegistered = true
 }
 
@@ -97,6 +106,19 @@ export function registerITermBackend(
     `[registry] registerITermBackend called, class=${backendClass?.name || 'undefined'}`,
   )
   ITermBackendClass = backendClass
+}
+
+/**
+ * Registers the WindowsTerminalBackend class with the registry.
+ * Called by WindowsTerminalBackend.ts to avoid circular dependencies.
+ */
+export function registerWindowsTerminalBackend(
+  backendClass: new () => PaneBackend,
+): void {
+  logForDebugging(
+    `[registry] registerWindowsTerminalBackend called, class=${backendClass?.name || 'undefined'}`,
+  )
+  WindowsTerminalBackendClass = backendClass
 }
 
 /**
@@ -126,12 +148,25 @@ function createITermBackend(): PaneBackend {
 }
 
 /**
+ * Creates a WindowsTerminalBackend instance.
+ * Throws if WindowsTerminalBackend hasn't been registered.
+ */
+function createWindowsTerminalBackend(): PaneBackend {
+  if (!WindowsTerminalBackendClass) {
+    throw new Error(
+      'WindowsTerminalBackend not registered. Import WindowsTerminalBackend.ts before using the registry.',
+    )
+  }
+  return new WindowsTerminalBackendClass()
+}
+
+/**
  * Detection priority flow:
- * 1. If inside tmux, always use tmux (even in iTerm2)
+ * 1. If inside tmux, always use tmux (even in iTerm2 or Windows Terminal)
  * 2. If in iTerm2 with it2 available, use iTerm2 backend
- * 3. If in iTerm2 without it2, return result indicating setup needed
+ * 3. If in Windows Terminal with wt.exe available, use Windows Terminal backend
  * 4. If tmux available, use tmux (creates external session)
- * 5. Otherwise, throw error with instructions
+ * 5. Otherwise, throw error with platform-specific instructions
  */
 export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
   // Ensure backends are registered before detection
@@ -150,9 +185,10 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
   // Check all environment conditions upfront for logging
   const insideTmux = await isInsideTmux()
   const inITerm2 = isInITerm2()
+  const inWindowsTerminal = isInWindowsTerminal()
 
   logForDebugging(
-    `[BackendRegistry] Environment: insideTmux=${insideTmux}, inITerm2=${inITerm2}`,
+    `[BackendRegistry] Environment: insideTmux=${insideTmux}, inITerm2=${inITerm2}, inWindowsTerminal=${inWindowsTerminal}`,
   )
 
   // Priority 1: If inside tmux, always use tmux
@@ -230,7 +266,45 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
     )
   }
 
-  // Priority 3: Fall back to tmux external session
+  // Priority 3: If in Windows Terminal, use native split panes
+  if (inWindowsTerminal) {
+    const wtAvailable = await isWtCliAvailable()
+    logForDebugging(
+      `[BackendRegistry] Windows Terminal detected, wt.exe available: ${wtAvailable}`,
+    )
+
+    if (wtAvailable) {
+      logForDebugging(
+        '[BackendRegistry] Selected: windows-terminal (native Windows Terminal split panes)',
+      )
+      const backend = createWindowsTerminalBackend()
+      cachedBackend = backend
+      cachedDetectionResult = {
+        backend,
+        isNative: true,
+        needsIt2Setup: false,
+      }
+      return cachedDetectionResult
+    }
+
+    // In Windows Terminal but wt.exe not in PATH - try tmux as fallback
+    const tmuxFallback = await isTmuxAvailable()
+    if (tmuxFallback) {
+      logForDebugging(
+        '[BackendRegistry] Selected: tmux (fallback in Windows Terminal, wt.exe not in PATH)',
+      )
+      const backend = createTmuxBackend()
+      cachedBackend = backend
+      cachedDetectionResult = {
+        backend,
+        isNative: false,
+        needsIt2Setup: false,
+      }
+      return cachedDetectionResult
+    }
+  }
+
+  // Priority 4: Fall back to tmux external session
   const tmuxAvailable = await isTmuxAvailable()
   logForDebugging(
     `[BackendRegistry] Not in tmux or iTerm2, tmux available: ${tmuxAvailable}`,
@@ -250,13 +324,13 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
 
   // No backend available - tmux is not installed
   logForDebugging('[BackendRegistry] ERROR: No pane backend available')
-  throw new Error(getTmuxInstallInstructions())
+  throw new Error(getPaneBackendInstallInstructions())
 }
 
 /**
  * Returns platform-specific tmux installation instructions.
  */
-function getTmuxInstallInstructions(): string {
+function getPaneBackendInstallInstructions(): string {
   const platform = getPlatform()
 
   switch (platform) {
@@ -273,10 +347,12 @@ Then start a tmux session with: tmux new-session -s claude`
 Then start a tmux session with: tmux new-session -s claude`
 
     case 'windows':
-      return `To use agent swarms, you need tmux which requires WSL (Windows Subsystem for Linux).
-Install WSL first, then inside WSL run:
-  sudo apt install tmux
-Then start a tmux session with: tmux new-session -s claude`
+      return `To use agent swarms on Windows, you have two options:
+1. Use Windows Terminal (recommended): Install Windows Terminal from the Microsoft Store
+   and ensure wt.exe is in your PATH.
+2. Use tmux via WSL: Install WSL first, then inside WSL run:
+   sudo apt install tmux
+   Then start a tmux session with: tmux new-session -s claude`
 
     default:
       return `To use agent swarms, install tmux using your system's package manager.
@@ -298,6 +374,8 @@ export function getBackendByType(type: PaneBackendType): PaneBackend {
       return createTmuxBackend()
     case 'iterm2':
       return createITermBackend()
+    case 'windows-terminal':
+      return createWindowsTerminalBackend()
   }
 }
 
@@ -376,14 +454,15 @@ export function isInProcessEnabled(): boolean {
       return true
     }
     // Check if a pane backend environment is available
-    // If inside tmux or iTerm2, use pane backend; otherwise use in-process
+    // If inside tmux, iTerm2, or Windows Terminal, use pane backend; otherwise use in-process
     const insideTmux = isInsideTmuxSync()
     const inITerm2 = isInITerm2()
-    enabled = !insideTmux && !inITerm2
+    const inWT = isInWindowsTerminal()
+    enabled = !insideTmux && !inITerm2 && !inWT
   }
 
   logForDebugging(
-    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${isInsideTmuxSync()}, inITerm2=${isInITerm2()})`,
+    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${isInsideTmuxSync()}, inITerm2=${isInITerm2()}, inWindowsTerminal=${isInWindowsTerminal()})`,
   )
   return enabled
 }

@@ -119,10 +119,52 @@ export async function isIt2CliAvailable(): Promise<boolean> {
   return result.code === 0
 }
 
+// =============================================================================
+// Windows Terminal Detection
+// =============================================================================
+
+/** Cached result for isInWindowsTerminal */
+let isInWindowsTerminalCached: boolean | null = null
+
+/**
+ * The Windows Terminal executable command name.
+ * Available on Windows and WSL (via Windows interop).
+ */
+export const WT_COMMAND = 'wt.exe'
+
+/**
+ * Checks if we're currently running inside Windows Terminal.
+ * Windows Terminal sets the WT_SESSION environment variable when a process
+ * runs inside it. This works both on native Windows and WSL.
+ *
+ * Caches the result since this won't change during the process lifetime.
+ */
+export function isInWindowsTerminal(): boolean {
+  if (isInWindowsTerminalCached !== null) {
+    return isInWindowsTerminalCached
+  }
+
+  // WT_SESSION is set by Windows Terminal for all sessions it hosts
+  isInWindowsTerminalCached = !!process.env.WT_SESSION
+
+  return isInWindowsTerminalCached
+}
+
+/**
+ * Checks if the wt.exe CLI is available on the system.
+ * On native Windows, wt.exe is in PATH when Windows Terminal is installed.
+ * On WSL, wt.exe is accessible via Windows interop (/mnt/c/... or directly in PATH).
+ */
+export async function isWtCliAvailable(): Promise<boolean> {
+  const result = await execFileNoThrow(WT_COMMAND, ['--version'])
+  return result.code === 0
+}
+
 /**
  * Resets all cached detection results. Used for testing.
  */
 export function resetDetectionCache(): void {
   isInsideTmuxCached = null
   isInITerm2Cached = null
+  isInWindowsTerminalCached = null
 }
