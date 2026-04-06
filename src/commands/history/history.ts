@@ -1,9 +1,10 @@
 import type { LocalCommandCall } from '../../types/command.js'
+import { getPipeIpc } from '../../utils/pipeTransport.js'
 
 export const call: LocalCommandCall = async (args, context) => {
   const currentState = context.getAppState()
 
-  if (currentState.pipeIpc.role !== 'master') {
+  if (getPipeIpc(currentState).role !== 'master') {
     return {
       type: 'text',
       value: 'Not in master mode. Use /attach <pipe-name> first.',
@@ -15,7 +16,7 @@ export const call: LocalCommandCall = async (args, context) => {
 
   if (!targetName) {
     // Show list of slaves
-    const slaveNames = Object.keys(currentState.pipeIpc.slaves)
+    const slaveNames = Object.keys(getPipeIpc(currentState).slaves)
     if (slaveNames.length === 0) {
       return { type: 'text', value: 'No slaves connected.' }
     }
@@ -25,7 +26,7 @@ export const call: LocalCommandCall = async (args, context) => {
     }
   }
 
-  const slave = currentState.pipeIpc.slaves[targetName]
+  const slave = getPipeIpc(currentState).slaves[targetName]
   if (!slave) {
     return {
       type: 'text',

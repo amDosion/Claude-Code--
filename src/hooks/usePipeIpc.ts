@@ -28,6 +28,7 @@ import {
 import { getSessionId } from '../bootstrap/state.js'
 import {
   createPipeServer,
+  getPipeIpc,
   type PipeMessage,
   type PipeServer,
 } from '../utils/pipeTransport.js'
@@ -53,7 +54,7 @@ type Props = {
 export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void {
   const setAppState = useSetAppState()
   const store = useAppStateStore()
-  const pipeRole = useAppState((s) => s.pipeIpc.role)
+  const pipeRole = useAppState((s) => getPipeIpc(s).role)
 
   const serverRef = useRef<PipeServer | null>(null)
   // Track all connected master sockets (in slave mode, only one master at a time)
@@ -90,13 +91,13 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
 
         setAppState((prev) => ({
           ...prev,
-          pipeIpc: { ...prev.pipeIpc, serverName: pipeName },
+          pipeIpc: { ...getPipeIpc(prev), serverName: pipeName },
         }))
 
         // Expose sendToMaster globally so REPL onQueryEvent can relay output
         ;(globalThis as any).__pipeSendToMaster = (msg: PipeMessage) => {
           const currentState = store.getState()
-          if (currentState.pipeIpc.role !== 'slave') return
+          if (getPipeIpc(currentState).role !== 'slave') return
           const masterSocket = masterSocketRef.current
           if (server && masterSocket && !masterSocket.destroyed) {
             server.sendTo(masterSocket, msg)
@@ -117,10 +118,10 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
           if (msg.type === 'attach_request') {
             const currentState = store.getState()
 
-            if (currentState.pipeIpc.role === 'slave') {
+            if (getPipeIpc(currentState).role === 'slave') {
               reply({
                 type: 'attach_reject',
-                data: `Already controlled by ${currentState.pipeIpc.attachedBy}`,
+                data: `Already controlled by ${getPipeIpc(currentState).attachedBy}`,
               })
               logForDebugging(`[PipeIpc] Rejected attach from ${msg.from}: already slave`)
               return
@@ -139,7 +140,7 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
                   setAppState((prev) => ({
                     ...prev,
                     pipeIpc: {
-                      ...prev.pipeIpc,
+                      ...getPipeIpc(prev),
                       role: 'standalone',
                       attachedBy: null,
                     },
@@ -152,7 +153,7 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
             setAppState((prev) => ({
               ...prev,
               pipeIpc: {
-                ...prev.pipeIpc,
+                ...getPipeIpc(prev),
                 role: 'slave',
                 attachedBy: msg.from ?? 'unknown',
               },
@@ -173,7 +174,7 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
             setAppState((prev) => ({
               ...prev,
               pipeIpc: {
-                ...prev.pipeIpc,
+                ...getPipeIpc(prev),
                 role: 'standalone',
                 attachedBy: null,
               },
@@ -186,7 +187,7 @@ export function usePipeIpc({ enabled, isLoading, onSubmitMessage }: Props): void
         server.onMessage((msg, _reply) => {
           if (msg.type === 'prompt') {
             const currentState = store.getState()
-            if (currentState.pipeIpc.role !== 'slave') return
+            if (getPipeIpc(currentState).role !== 'slave') return
 
             const promptText = msg.data ?? ''
             if (!promptText) return

@@ -1,14 +1,15 @@
 import type { LocalCommandCall } from '../../types/command.js'
 import { removeSlaveClient, getAllSlaveClients } from '../../hooks/useMasterMonitor.js'
+import { getPipeIpc } from '../../utils/pipeTransport.js'
 
 export const call: LocalCommandCall = async (args, context) => {
   const currentState = context.getAppState()
 
-  if (currentState.pipeIpc.role === 'standalone') {
+  if (getPipeIpc(currentState).role === 'standalone') {
     return { type: 'text', value: 'Not attached to any CLI.' }
   }
 
-  if (currentState.pipeIpc.role === 'slave') {
+  if (getPipeIpc(currentState).role === 'slave') {
     return {
       type: 'text',
       value: 'This CLI is in slave mode. The master must detach.',
@@ -37,12 +38,12 @@ export const call: LocalCommandCall = async (args, context) => {
 
     // Remove slave from state
     context.setAppState((prev) => {
-      const { [targetName]: _removed, ...remainingSlaves } = prev.pipeIpc.slaves
+      const { [targetName]: _removed, ...remainingSlaves } = getPipeIpc(prev).slaves
       const hasSlaves = Object.keys(remainingSlaves).length > 0
       return {
         ...prev,
         pipeIpc: {
-          ...prev.pipeIpc,
+          ...getPipeIpc(prev),
           role: hasSlaves ? 'master' : 'standalone',
           slaves: remainingSlaves,
         },
@@ -74,7 +75,7 @@ export const call: LocalCommandCall = async (args, context) => {
   context.setAppState((prev) => ({
     ...prev,
     pipeIpc: {
-      ...prev.pipeIpc,
+      ...getPipeIpc(prev),
       role: 'standalone',
       slaves: {},
     },

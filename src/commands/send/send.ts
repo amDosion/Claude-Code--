@@ -1,10 +1,11 @@
 import type { LocalCommandCall } from '../../types/command.js'
 import { getSlaveClient } from '../../hooks/useMasterMonitor.js'
+import { getPipeIpc } from '../../utils/pipeTransport.js'
 
 export const call: LocalCommandCall = async (args, context) => {
   const currentState = context.getAppState()
 
-  if (currentState.pipeIpc.role !== 'master') {
+  if (getPipeIpc(currentState).role !== 'master') {
     return {
       type: 'text',
       value: 'Not in master mode. Use /attach <pipe-name> first.',
@@ -54,14 +55,14 @@ export const call: LocalCommandCall = async (args, context) => {
 
     // Record the sent prompt in history
     context.setAppState((prev) => {
-      const slave = prev.pipeIpc.slaves[targetName]
+      const slave = getPipeIpc(prev).slaves[targetName]
       if (!slave) return prev
       return {
         ...prev,
         pipeIpc: {
-          ...prev.pipeIpc,
+          ...getPipeIpc(prev),
           slaves: {
-            ...prev.pipeIpc.slaves,
+            ...getPipeIpc(prev).slaves,
             [targetName]: {
               ...slave,
               status: 'busy' as const,
@@ -70,7 +71,7 @@ export const call: LocalCommandCall = async (args, context) => {
                 {
                   type: 'prompt' as const,
                   content: message,
-                  from: currentState.pipeIpc.serverName ?? 'master',
+                  from: getPipeIpc(currentState).serverName ?? 'master',
                   timestamp: new Date().toISOString(),
                 },
               ],

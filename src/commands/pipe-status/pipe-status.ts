@@ -1,25 +1,26 @@
 import type { LocalCommandCall } from '../../types/command.js'
 import { getAllSlaveClients } from '../../hooks/useMasterMonitor.js'
+import { getPipeIpc } from '../../utils/pipeTransport.js'
 
 export const call: LocalCommandCall = async (_args, context) => {
   const currentState = context.getAppState()
 
-  if (currentState.pipeIpc.role === 'standalone') {
+  if (getPipeIpc(currentState).role === 'standalone') {
     return {
       type: 'text',
       value: 'Standalone mode — not connected to any CLIs.\nUse /attach <pipe-name> to connect to a slave.',
     }
   }
 
-  if (currentState.pipeIpc.role === 'slave') {
+  if (getPipeIpc(currentState).role === 'slave') {
     return {
       type: 'text',
-      value: `Slave mode — controlled by "${currentState.pipeIpc.attachedBy}".\nAll session data is being reported to the master.`,
+      value: `Slave mode — controlled by "${getPipeIpc(currentState).attachedBy}".\nAll session data is being reported to the master.`,
     }
   }
 
   // Master mode
-  const slaves = currentState.pipeIpc.slaves
+  const slaves = getPipeIpc(currentState).slaves
   const slaveNames = Object.keys(slaves)
   const clients = getAllSlaveClients()
 

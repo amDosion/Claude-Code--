@@ -13,7 +13,7 @@
 
 import { useEffect, useRef } from 'react'
 import { useAppState } from '../state/AppState.js'
-import type { PipeClient, PipeMessage } from '../utils/pipeTransport.js'
+import { getPipeIpc, type PipeClient, type PipeMessage } from '../utils/pipeTransport.js'
 import { logForDebugging } from '../utils/debug.js'
 
 const PIPE_RELAY_TAG = 'pipe_relay'
@@ -46,12 +46,26 @@ export function useMasterRelay({
   masterClient,
   onSubmitMessage,
 }: Props): void {
-  const role = useAppState((s) => s.pipeIpc.role)
+  const role = useAppState((s) => getPipeIpc(s).role)
+
+  // Use refs to avoid re-binding the handler when callback identity changes
+  const onSubmitRef = useRef(onSubmitMessage)
+  onSubmitRef.current = onSubmitMessage
+
+  // Track the client we've bound to so we only bind once per client instance
+  const boundClientRef = useRef<PipeClient | null>(null)
 
   useEffect(() => {
-    if (!enabled || role !== 'master' || !masterClient) return
+    if (!enabled || role !== 'master' || !masterClient) {
+      boundClientRef.current = null
+      return
+    }
+
+    // Skip if we've already bound a handler to this exact client instance
+    if (boundClientRef.current === masterClient) return
 
     logForDebugging(`[MasterRelay] Listening to slave output`)
+    boundClientRef.current = masterClient
 
     // Accumulate stream fragments for the current turn
     let streamBuffer = ''
@@ -70,7 +84,7 @@ export function useMasterRelay({
           streamBuffer = ''
 
           const formatted = `<${PIPE_RELAY_TAG} from="${msg.from ?? 'slave'}" type="response">\n${output}\n</${PIPE_RELAY_TAG}>`
-          const submitted = onSubmitMessage(formatted)
+          const submitted = onSubmitRef.current(formatted)
           if (!submitted) {
             logForDebugging(`[MasterRelay] Failed to inject slave output (master busy)`)
           }
@@ -89,7 +103,10 @@ export function useMasterRelay({
 
         case 'error': {
           const formatted = `<${PIPE_RELAY_TAG} from="${msg.from ?? 'slave'}" type="error">\n${msg.data ?? 'Unknown error'}\n</${PIPE_RELAY_TAG}>`
-          onSubmitMessage(formatted)
+          const submitted = onSubmitRef.current(formatted)
+          if (!submitted) {
+            logForDebugging(`[MasterRelay] Failed to inject slave error (master busy)`)
+          }
           break
         }
 
@@ -106,9 +123,8 @@ export function useMasterRelay({
     masterClient.onMessage(handler)
 
     return () => {
-      // PipeClient doesn't support removeHandler, but cleanup on unmount
-      // is handled by disconnect in /detach command
       streamBuffer = ''
+      boundClientRef.current = null
     }
-  }, [enabled, role, masterClient, onSubmitMessage])
+  }, [enabled, role, masterClient])
 }
