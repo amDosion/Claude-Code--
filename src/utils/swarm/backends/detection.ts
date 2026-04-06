@@ -154,9 +154,14 @@ export function isInWindowsTerminal(): boolean {
  * Checks if the wt.exe CLI is available on the system.
  * On native Windows, wt.exe is in PATH when Windows Terminal is installed.
  * On WSL, wt.exe is accessible via Windows interop (/mnt/c/... or directly in PATH).
+ *
+ * Uses `wt.exe -?` since wt.exe doesn't support `--version`.
+ * See: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
  */
 export async function isWtCliAvailable(): Promise<boolean> {
-  const result = await execFileNoThrow(WT_COMMAND, ['--version'])
+  // wt.exe -? prints help and exits with code 0 if available.
+  // Unlike --version (which doesn't exist), -? is a documented flag.
+  const result = await execFileNoThrow(WT_COMMAND, ['-?'])
   return result.code === 0
 }
 

@@ -8,8 +8,9 @@ import type { CreatePaneResult, PaneBackend, PaneId } from './types.js'
 
 /**
  * Tracks created panes by their synthetic ID.
- * Windows Terminal doesn't provide pane IDs, so we generate UUIDs
- * and associate them with the command that was deferred for execution.
+ * Windows Terminal doesn't provide pane IDs (see microsoft/terminal#16568),
+ * so we generate synthetic IDs and associate them with metadata for
+ * deferred pane creation.
  */
 type DeferredPane = {
   name: string
@@ -26,7 +27,8 @@ let paneCount = 0
 // Lock mechanism to prevent race conditions when spawning teammates in parallel
 let paneCreationLock: Promise<void> = Promise.resolve()
 
-// Delay after pane creation to allow shell initialization
+// Delay after pane creation to allow shell initialization.
+// Slightly longer than tmux (200ms) because wt.exe spawns a new conhost process.
 const PANE_SHELL_INIT_DELAY_MS = 500
 
 function waitForPaneShellReady(): Promise<void> {
@@ -57,47 +59,47 @@ function generatePaneId(): string {
 }
 
 /**
- * Maps agent colors to Windows Terminal ANSI color names for --tabColor.
- * Windows Terminal supports hex colors for tab coloring.
- */
-function getWtTabColor(color: AgentColorName): string {
-  const wtColors: Record<AgentColorName, string> = {
-    red: '#FF0000',
-    blue: '#0078D7',
-    green: '#00CC6A',
-    yellow: '#FFB900',
-    purple: '#B4009E',
-    orange: '#FF8C00',
-    pink: '#E74856',
-    cyan: '#00B7C3',
-  }
-  return wtColors[color]
-}
-
-/**
  * WindowsTerminalBackend implements PaneBackend using Windows Terminal's
  * native split-pane functionality via the wt.exe CLI.
+ *
+ * Reference: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
  *
  * Key design decisions:
  *
  * 1. DEFERRED PANE CREATION: Windows Terminal's `wt.exe split-pane` requires
  *    the command at creation time (unlike tmux where you create a pane then
- *    send commands). So createTeammatePaneInSwarmView() returns a synthetic
- *    pane ID, and sendCommandToPane() actually creates the split pane with
- *    the command.
+ *    send commands to it). So createTeammatePaneInSwarmView() returns a
+ *    synthetic pane ID, and sendCommandToPane() actually creates the split
+ *    pane with the command baked in.
  *
  * 2. NO PANE IDS: Windows Terminal doesn't expose pane IDs through its CLI.
- *    We generate synthetic IDs for internal tracking.
+ *    (See microsoft/terminal#16568 for the feature request.)
+ *    We generate synthetic IDs for internal tracking only.
  *
- * 3. LIMITED PANE MANAGEMENT: After creation, we can't query pane state,
- *    resize, or rebalance. Windows Terminal handles its own layout.
+ * 3. LIMITED POST-CREATION MANAGEMENT: After creation, we cannot query pane
+ *    state, send new commands, resize programmatically, or kill individual
+ *    panes. Windows Terminal handles its own layout. Available post-creation
+ *    operations are limited to directional navigation:
+ *    - move-focus --direction {up|down|left|right|first|previous|...}
+ *    - swap-pane --direction {up|down|left|right|...}
  *
  * 4. CROSS-PLATFORM: Works on both native Windows and WSL (via Windows interop).
  *    On WSL, wt.exe is accessible through the /mnt/c path or directly in PATH.
  *
- * Architecture:
- * - First pane: vertical split (-V) to create left/right layout
- * - Subsequent panes: alternate horizontal (-H) splits to stack on the right
+ * 5. SPLIT-PANE CLI FLAGS (official):
+ *    - `-H` / `--horizontal`: New pane below
+ *    - `-V` / `--vertical`: New pane to the right
+ *    - `-s` / `--size`: Decimal fraction of available space (0.0-1.0)
+ *    - `--title`: Custom pane title
+ *    - `-d` / `--startingDirectory`: Working directory
+ *    - `-p` / `--profile`: Terminal profile name or GUID
+ *    Note: `--tabColor` and `--colorScheme` are new-tab flags only,
+ *    NOT available on split-pane.
+ *
+ * Layout strategy:
+ * - First pane: vertical split (-V, --size 0.7) to create left/right layout
+ *   with leader on left (30%) and teammate on right (70%)
+ * - Subsequent panes: horizontal splits (-H) from right side to stack vertically
  * - All panes target the current window (-w 0)
  */
 export class WindowsTerminalBackend implements PaneBackend {
@@ -155,7 +157,8 @@ export class WindowsTerminalBackend implements PaneBackend {
    * The command is executed directly in the new pane via `wt.exe -w 0 split-pane`.
    *
    * After the initial creation, subsequent calls for the same pane are no-ops
-   * since Windows Terminal doesn't support sending commands to existing panes.
+   * since Windows Terminal doesn't support sending commands to existing panes
+   * (no equivalent to tmux send-keys or iTerm2 session run).
    */
   async sendCommandToPane(
     paneId: PaneId,
@@ -171,14 +174,18 @@ export class WindowsTerminalBackend implements PaneBackend {
       return
     }
 
-    const { name, color, direction } = paneInfo
-    const tabColor = getWtTabColor(color)
+    const { name, direction } = paneInfo
 
     // Build wt.exe split-pane command
-    // -w 0: target the current/most-recent window
-    // --title: set the pane/tab title
-    // --tabColor: set the tab color indicator
-    // --size 0.7: first pane gets 70% width (leader keeps 30%)
+    // Reference: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
+    //
+    // -w 0: target the most recent window (current window)
+    // split-pane: create a new pane by splitting
+    // --title: set the pane title (visible in Windows Terminal UI)
+    // --size: decimal fraction of available space for the new pane
+    //
+    // Note: --tabColor is a new-tab flag only, NOT available on split-pane.
+    // Pane identification relies on --title since wt.exe has no pane ID system.
     const wtArgs = [
       '-w',
       '0',
@@ -186,8 +193,6 @@ export class WindowsTerminalBackend implements PaneBackend {
       direction,
       '--title',
       name,
-      '--tabColor',
-      tabColor,
     ]
 
     // First pane gets 70% of space (leader keeps 30%)
@@ -195,15 +200,21 @@ export class WindowsTerminalBackend implements PaneBackend {
       wtArgs.push('--size', '0.7')
     }
 
-    // The command needs to be passed as shell execution since wt.exe
-    // split-pane runs the command directly.
-    // On Windows: use cmd.exe /k to keep the pane open after command exits
-    // On WSL: use the command directly (wt.exe handles WSL interop)
+    // Pass the command to execute in the new pane.
+    //
+    // The PaneBackendExecutor builds the full spawn command including:
+    //   cd <workingDir> && env KEY=VAL ... claude --agent-id ...
+    // (or a customCommand for non-Claude tools)
+    //
+    // On native Windows (win32): wrap in cmd.exe /k to keep pane alive
+    //   after command completion and for proper shell interpretation.
+    // On WSL: wrap in bash -c since the command contains shell constructs
+    //   (cd, &&, env vars). wt.exe on WSL creates a new WSL pane by default.
     if (process.platform === 'win32') {
+      // cmd.exe /k runs command and stays open (unlike /c which closes)
       wtArgs.push('cmd.exe', '/k', command)
     } else {
-      // On WSL, we need to wrap in bash -c for proper shell interpretation
-      // since the command may contain env vars, pipes, etc.
+      // On WSL, bash -c interprets the compound command string
       wtArgs.push('bash', '-c', command)
     }
 
@@ -226,25 +237,28 @@ export class WindowsTerminalBackend implements PaneBackend {
       `[WindowsTerminalBackend] Created split pane for ${name}: ${paneId}`,
     )
 
-    // Wait for shell to initialize
+    // Wait for shell to initialize in the new pane
     await waitForPaneShellReady()
   }
 
   /**
    * No-op for Windows Terminal.
-   * Tab/pane colors are set during creation via --tabColor.
+   * There is no post-creation API to change pane border colors.
+   * Color differentiation can only be done at pane creation time via
+   * terminal profile color schemes.
    */
   async setPaneBorderColor(
     _paneId: PaneId,
     _color: AgentColorName,
     _useExternalSession?: boolean,
   ): Promise<void> {
-    // Color is set during pane creation via --tabColor
+    // Windows Terminal has no API to change pane colors after creation
   }
 
   /**
    * No-op for Windows Terminal.
-   * Pane titles are set during creation via --title.
+   * Pane titles are set during creation via --title flag.
+   * There is no post-creation API to change pane titles.
    */
   async setPaneTitle(
     _paneId: PaneId,
@@ -257,7 +271,7 @@ export class WindowsTerminalBackend implements PaneBackend {
 
   /**
    * No-op for Windows Terminal.
-   * Windows Terminal always shows pane titles in its UI.
+   * Windows Terminal shows pane titles in its native UI automatically.
    */
   async enablePaneBorderStatus(
     _windowTarget?: string,
@@ -270,6 +284,7 @@ export class WindowsTerminalBackend implements PaneBackend {
    * No-op for Windows Terminal.
    * Windows Terminal manages its own pane layout automatically.
    * Users can manually resize panes with Alt+Shift+Arrow keys.
+   * Programmatic pane resizing is not available via wt.exe CLI.
    */
   async rebalancePanes(
     _windowTarget: string,
@@ -283,10 +298,12 @@ export class WindowsTerminalBackend implements PaneBackend {
   /**
    * Attempts to close a pane.
    *
-   * Windows Terminal doesn't provide a CLI to kill specific panes by ID.
-   * Since we use synthetic IDs, we can only clean up our internal tracking.
-   * The actual pane closes when the process inside it exits (e.g., via
-   * mailbox shutdown request).
+   * Windows Terminal doesn't provide a CLI to kill specific panes
+   * (no pane ID system, see microsoft/terminal#16568).
+   * We can only clean up internal tracking state.
+   * The actual pane closes when the process inside it exits, either:
+   * - Via mailbox shutdown request (graceful)
+   * - When the user manually closes it (Ctrl+Shift+W)
    */
   async killPane(
     paneId: PaneId,
@@ -302,14 +319,14 @@ export class WindowsTerminalBackend implements PaneBackend {
       `[WindowsTerminalBackend] killPane ${paneId}: cleaned up tracking (actual pane closes when process exits)`,
     )
 
-    // Return true since we cleaned up - the pane will close when the
-    // process inside it receives a shutdown request via mailbox
+    // Return true - the pane will close when the process receives
+    // a shutdown request via the mailbox system
     return true
   }
 
   /**
    * Not supported in Windows Terminal.
-   * Windows Terminal doesn't support hiding/showing individual panes.
+   * There is no equivalent to tmux's break-pane / join-pane.
    */
   async hidePane(
     _paneId: PaneId,
@@ -323,7 +340,7 @@ export class WindowsTerminalBackend implements PaneBackend {
 
   /**
    * Not supported in Windows Terminal.
-   * Windows Terminal doesn't support hiding/showing individual panes.
+   * There is no equivalent to tmux's break-pane / join-pane.
    */
   async showPane(
     _paneId: PaneId,
