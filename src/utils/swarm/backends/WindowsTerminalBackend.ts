@@ -63,6 +63,7 @@ function generatePaneId(): string {
  * native split-pane functionality via the wt.exe CLI.
  *
  * Reference: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
+ * Limitations & custom solution proposal: docs/08-windows-terminal-pane-management.md
  *
  * Key design decisions:
  *
