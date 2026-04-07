@@ -1,63 +1,63 @@
-# Windows Terminal Split Screen Support — Change Report
+# Windows Terminal 分屏支持 — 变更报告
 
-**Branch**: `claude/windows-split-screen-support-dXHYc`
-**Date**: 2026-04-07
-**Commits**: 3
-
----
-
-## 1. Summary
-
-This PR adds **native Windows Terminal split-pane support** to Claude Code's swarm
-system, and **decouples pane spawning from Claude-only usage**, enabling arbitrary
-CLI tools (cldex, Gemini CLI, custom scripts, etc.) to run in split panes.
-
-### Before
-
-- Split-screen ONLY supported via **tmux** (cross-platform) and **iTerm2** (macOS)
-- Windows users REQUIRED WSL + tmux to use agent swarms
-- PaneBackendExecutor hardcoded Claude binary spawning — no support for non-Claude tools
-
-### After
-
-- New **WindowsTerminalBackend** uses `wt.exe split-pane` for native Windows Terminal support
-- Auto-detected via `WT_SESSION` env var (works on both native Windows and WSL)
-- PaneBackendExecutor supports `customCommand` and `skipMailbox` for arbitrary tool spawning
-- Detection priority: tmux(inside) → iTerm2 → **Windows Terminal** → tmux(external)
+**分支**: `claude/windows-split-screen-support-dXHYc`
+**日期**: 2026-04-07
+**提交数**: 3
 
 ---
 
-## 2. Files Changed (6 files, +758 / -65 lines)
+## 1. 概述
 
-| # | File | Action | Lines Changed | Purpose |
-|---|------|--------|---------------|---------|
-| 1 | `src/utils/swarm/backends/WindowsTerminalBackend.ts` | **NEW** | +360 | Core backend implementation |
-| 2 | `src/utils/swarm/backends/detection.ts` | Modified | +47 | WT_SESSION detection + wt.exe availability check |
-| 3 | `src/utils/swarm/backends/registry.ts` | Modified | +107/-20 | Backend registration, detection priority, install instructions |
-| 4 | `src/utils/swarm/backends/types.ts` | Modified | +28/-4 | Add 'windows-terminal' type, customCommand/skipMailbox options |
-| 5 | `src/utils/swarm/backends/PaneBackendExecutor.ts` | Modified | +41/-41 | Support customCommand for non-Claude tools |
-| 6 | `docs/08-windows-terminal-pane-management.md` | **NEW** | +175 | Limitations tracking and custom solution proposals |
+本 PR 为 Claude Code 的 swarm 系统添加了 **Windows Terminal 原生分屏支持**，
+并将 **窗格启动逻辑与 Claude 解耦**，使任意 CLI 工具（cldex、Gemini CLI、自定义脚本等）
+均可在分屏窗格中运行。
+
+### 变更前
+
+- 分屏 **仅** 支持 **tmux**（跨平台）和 **iTerm2**（macOS）
+- Windows 用户 **必须安装 WSL + tmux** 才能使用 agent swarm
+- PaneBackendExecutor 硬编码只启动 Claude 二进制 — 不支持非 Claude 工具
+
+### 变更后
+
+- 新增 **WindowsTerminalBackend**，使用 `wt.exe split-pane` 实现 Windows Terminal 原生分屏
+- 通过 `WT_SESSION` 环境变量自动检测（原生 Windows 和 WSL 均可）
+- PaneBackendExecutor 支持 `customCommand` 和 `skipMailbox`，可启动任意工具
+- 检测优先级：tmux(内部) → iTerm2 → **Windows Terminal** → tmux(外部)
 
 ---
 
-## 3. Detailed Evidence of Changes
+## 2. 变更文件（6个文件，+758 / -65 行）
 
-### 3.1 WindowsTerminalBackend.ts (NEW — 360 lines)
+| # | 文件 | 操作 | 行数变更 | 用途 |
+|---|------|------|----------|------|
+| 1 | `src/utils/swarm/backends/WindowsTerminalBackend.ts` | **新增** | +360 | 核心后端实现 |
+| 2 | `src/utils/swarm/backends/detection.ts` | 修改 | +47 | WT 检测函数 |
+| 3 | `src/utils/swarm/backends/registry.ts` | 修改 | +107/-20 | 后端注册、检测优先级、安装提示 |
+| 4 | `src/utils/swarm/backends/types.ts` | 修改 | +28/-4 | 类型定义 |
+| 5 | `src/utils/swarm/backends/PaneBackendExecutor.ts` | 修改 | +41/-41 | 自定义命令支持 |
+| 6 | `docs/08-windows-terminal-pane-management.md` | **新增** | +175 | 限制追踪与解决方案提案 |
 
-**Location**: `src/utils/swarm/backends/WindowsTerminalBackend.ts`
+---
 
-**Architecture**: Deferred pane creation pattern.
+## 3. 详细变更证据
 
-Windows Terminal's `wt.exe split-pane` requires the command at creation time (unlike
-tmux where you create an empty pane then send commands). Therefore:
+### 3.1 WindowsTerminalBackend.ts（新增 — 360 行）
 
-- `createTeammatePaneInSwarmView()` → returns synthetic pane ID, stores metadata
-- `sendCommandToPane()` → actually creates the split pane with the command
+**路径**: `src/utils/swarm/backends/WindowsTerminalBackend.ts`
 
-**Key code evidence**:
+**架构**: 延迟创建模式（Deferred Pane Creation）。
+
+Windows Terminal 的 `wt.exe split-pane` 要求在创建窗格时就指定命令（不同于 tmux
+先创建空窗格再发送命令的模式）。因此：
+
+- `createTeammatePaneInSwarmView()` → 返回合成 pane ID，存储元数据
+- `sendCommandToPane()` → 实际创建分屏窗格并执行命令
+
+**关键代码证据**：
 
 ```typescript
-// Deferred pane creation — registers metadata, returns synthetic ID
+// 延迟创建 — 注册元数据，返回合成 ID
 async createTeammatePaneInSwarmView(
   name: string,
   color: AgentColorName,
@@ -70,11 +70,11 @@ async createTeammatePaneInSwarmView(
   return { paneId, isFirstTeammate }
 }
 
-// Actual pane creation happens here
+// 实际创建窗格在这里发生
 async sendCommandToPane(paneId: PaneId, command: string): Promise<void> {
   const wtArgs = ['-w', '0', 'split-pane', direction, '--title', name]
   if (direction === '-V') wtArgs.push('--size', '0.7')
-  // Platform-specific command wrapping
+  // 平台特定的命令包装
   if (process.platform === 'win32') {
     wtArgs.push('cmd.exe', '/k', command)
   } else {
@@ -84,23 +84,23 @@ async sendCommandToPane(paneId: PaneId, command: string): Promise<void> {
 }
 ```
 
-**Self-registration pattern** (matches TmuxBackend/ITermBackend):
+**自注册模式**（与 TmuxBackend/ITermBackend 一致）：
 ```typescript
 registerWindowsTerminalBackend(WindowsTerminalBackend)
 ```
 
 ---
 
-### 3.2 detection.ts — Windows Terminal Detection (+47 lines)
+### 3.2 detection.ts — Windows Terminal 检测（+47 行）
 
-**Added functions**:
+**新增函数**：
 
-| Function | Purpose | Detection Method |
-|----------|---------|------------------|
-| `isInWindowsTerminal()` | Check if running inside Windows Terminal | `WT_SESSION` env var |
-| `isWtCliAvailable()` | Check if wt.exe is in PATH | `wt.exe -?` (not `--version`, which doesn't exist) |
+| 函数 | 用途 | 检测方式 |
+|------|------|----------|
+| `isInWindowsTerminal()` | 判断是否在 Windows Terminal 内运行 | `WT_SESSION` 环境变量 |
+| `isWtCliAvailable()` | 判断 wt.exe 是否在 PATH 中 | `wt.exe -?`（非 `--version`，后者不存在） |
 
-**Evidence**:
+**证据**：
 ```typescript
 export const WT_COMMAND = 'wt.exe'
 
@@ -116,122 +116,122 @@ export async function isWtCliAvailable(): Promise<boolean> {
 }
 ```
 
-**Why `wt.exe -?` not `--version`**: Per official Microsoft docs
-(https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments),
-`--version` is NOT a documented wt.exe flag. `-?` is the correct help flag.
+**为什么用 `wt.exe -?` 而不是 `--version`**：根据 Microsoft 官方文档
+(https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments)，
+`--version` 不是 wt.exe 的合法参数。`-?` 是文档中记录的帮助标志。
 
-**Updated `resetDetectionCache()`** to include `isInWindowsTerminalCached`.
+**同时更新了 `resetDetectionCache()`** 以包含 `isInWindowsTerminalCached`。
 
 ---
 
-### 3.3 registry.ts — Backend Registration & Detection Priority (+107/-20 lines)
+### 3.3 registry.ts — 后端注册与检测优先级（+107/-20 行）
 
-**New detection priority flow**:
+**新的检测优先级流程**：
 
 ```
-Priority 1: Inside tmux          → TmuxBackend (always wins)
-Priority 2: In iTerm2 + it2 CLI  → ITermBackend
-Priority 3: In Windows Terminal   → WindowsTerminalBackend  ← NEW
-Priority 4: tmux available        → TmuxBackend (external session)
-Priority 5: Nothing available     → Error with platform-specific instructions
+优先级 1：在 tmux 内部         → TmuxBackend（始终优先）
+优先级 2：在 iTerm2 + it2 CLI  → ITermBackend
+优先级 3：在 Windows Terminal   → WindowsTerminalBackend  ← 新增
+优先级 4：tmux 可用             → TmuxBackend（外部会话）
+优先级 5：无可用后端            → 抛出错误并给出平台特定安装指引
 ```
 
-**Key additions**:
+**关键新增代码**：
 ```typescript
-// New registration function
+// 新的注册函数
 let WindowsTerminalBackendClass: (new () => PaneBackend) | null = null
 export function registerWindowsTerminalBackend(backendClass: new () => PaneBackend): void
 
-// Dynamic import
+// 动态导入
 await import('./WindowsTerminalBackend.js')
 
-// Detection block
+// 检测逻辑
 if (inWindowsTerminal) {
   const wtAvailable = await isWtCliAvailable()
   if (wtAvailable) {
     const backend = createWindowsTerminalBackend()
-    // ... cache and return
+    // ... 缓存并返回
   }
-  // Fallback to tmux if wt.exe not in PATH
+  // wt.exe 不在 PATH 中则回退到 tmux
 }
 
-// getBackendByType updated
+// getBackendByType 已更新
 case 'windows-terminal':
   return createWindowsTerminalBackend()
 ```
 
-**Updated install instructions for Windows**:
+**Windows 安装提示已更新**：
 ```
-Before: "requires WSL, then sudo apt install tmux"
-After:  "Option 1: Windows Terminal (recommended), Option 2: WSL + tmux"
+变更前："需要 WSL，然后 sudo apt install tmux"
+变更后："方案1：Windows Terminal（推荐），方案2：WSL + tmux"
 ```
 
-**Updated `isInProcessEnabled()`**:
+**`isInProcessEnabled()` 已更新**：
 ```typescript
 const inWT = isInWindowsTerminal()
-enabled = !insideTmux && !inITerm2 && !inWT  // WT now counts as pane backend
+enabled = !insideTmux && !inITerm2 && !inWT  // WT 现在算作窗格后端
 ```
 
 ---
 
-### 3.4 types.ts — Type System Updates (+28/-4 lines)
+### 3.4 types.ts — 类型系统更新（+28/-4 行）
 
-**BackendType expanded**:
+**BackendType 扩展**：
 ```typescript
-// Before
+// 变更前
 export type BackendType = 'tmux' | 'iterm2' | 'in-process'
 export type PaneBackendType = 'tmux' | 'iterm2'
 
-// After
+// 变更后
 export type BackendType = 'tmux' | 'iterm2' | 'windows-terminal' | 'in-process'
 export type PaneBackendType = 'tmux' | 'iterm2' | 'windows-terminal'
 ```
 
-**Type guard updated**:
+**类型守卫已更新**：
 ```typescript
 export function isPaneBackend(type: BackendType): type is 'tmux' | 'iterm2' | 'windows-terminal' {
   return type === 'tmux' || type === 'iterm2' || type === 'windows-terminal'
 }
 ```
 
-**TeammateSpawnConfig extended** (decoupling):
+**TeammateSpawnConfig 扩展**（解耦）：
 ```typescript
 export type TeammateSpawnConfig = TeammateIdentity & {
-  // ... existing fields ...
+  // ... 已有字段 ...
 
-  /** Custom command to execute instead of Claude binary */
+  /** 自定义命令，替代 Claude 二进制执行 */
   customCommand?: string
 
-  /** Skip mailbox write for non-Claude processes */
+  /** 跳过邮箱写入（用于非 Claude 进程） */
   skipMailbox?: boolean
 }
 ```
 
 ---
 
-### 3.5 PaneBackendExecutor.ts — Custom Command Support (+41/-41 lines)
+### 3.5 PaneBackendExecutor.ts — 自定义命令支持（+41/-41 行）
 
-**Before**: Hardcoded Claude binary spawning:
+**变更前**：硬编码 Claude 二进制启动：
 ```typescript
 const binaryPath = getTeammateCommand()
 const teammateArgs = [`--agent-id ...`, `--agent-name ...`, ...]
 const spawnCommand = `cd ${workingDir} && env ${envStr} ${binaryPath} ${teammateArgs}`
 ```
 
-**After**: Supports both Claude and arbitrary commands:
+**变更后**：同时支持 Claude 和任意命令：
 ```typescript
 let spawnCommand: string
 if (config.customCommand) {
-  // Custom command mode: direct execution, no Claude flags
+  // 自定义命令模式：直接执行，不附加 Claude 标志
   spawnCommand = `cd ${quote([workingDir])} && ${config.customCommand}`
 } else {
-  // Default mode: spawn Claude with teammate identity (unchanged logic)
+  // 默认模式：使用 teammate 身份启动 Claude（逻辑不变）
   const binaryPath = getTeammateCommand()
-  // ... same as before ...
+  // ... 与之前相同 ...
 }
 ```
 
-**Mailbox skip**:
+**邮箱跳过**：
 ```typescript
 if (!config.skipMailbox) {
   await writeToMailbox(config.name, { from: 'team-lead', text: config.prompt, ... }, config.teamName)
@@ -240,53 +240,52 @@ if (!config.skipMailbox) {
 
 ---
 
-## 4. Commit History
+## 4. 提交历史
 
-| # | Hash | Message |
-|---|------|---------|
-| 1 | `e8e1e78` | `feat: add Windows Terminal native split-pane backend and decouple pane spawning` |
-| 2 | `c953084` | `fix: correct WindowsTerminalBackend per official wt.exe CLI docs` |
-| 3 | `5099ba1` | `docs: track wt.exe limitations and custom pane manager proposals` |
-
----
-
-## 5. Known Limitations (Documented)
-
-See `docs/08-windows-terminal-pane-management.md` for full details.
-
-| Limitation | Impact | Workaround |
-|-----------|--------|------------|
-| No pane ID returned by wt.exe | Cannot track individual panes | Synthetic IDs |
-| No send-keys to existing pane | Cannot interact post-creation | Deferred creation pattern |
-| No kill-pane by ID | Cannot programmatically close | Mailbox shutdown request |
-| No pane state query | Cannot monitor health | Trust process lifecycle |
-| No post-creation color/title API | Cannot update visually | Set at creation time |
-
-**Upstream tracking**: `microsoft/terminal#16568`, `microsoft/terminal#8855`
+| # | 哈希 | 提交信息 |
+|---|------|----------|
+| 1 | `e8e1e78` | feat: 添加 Windows Terminal 原生分屏后端并解耦窗格启动 |
+| 2 | `c953084` | fix: 根据官方 wt.exe CLI 文档修正 WindowsTerminalBackend |
+| 3 | `5099ba1` | docs: 追踪 wt.exe 限制并提出自研窗格管理器方案 |
 
 ---
 
-## 6. Build Verification
+## 5. 已知限制（已记录）
+
+详见 `docs/08-windows-terminal-pane-management.md`。
+
+| 限制 | 影响 | 当前解决方案 |
+|------|------|-------------|
+| wt.exe 不返回 Pane ID | 无法追踪单个窗格 | 合成 ID |
+| 无法向已有窗格发送命令 | 无法在创建后交互 | 延迟创建模式 |
+| 无法按 ID 关闭窗格 | 无法程序化关闭 | 邮箱关闭请求 |
+| 无法查询窗格状态 | 无法监控健康 | 信任进程生命周期 |
+| 创建后无法更新颜色/标题 | 无法动态更新外观 | 创建时设置 |
+
+**上游追踪**: `microsoft/terminal#16568`, `microsoft/terminal#8855`
+
+---
+
+## 6. 构建验证
 
 ```
 $ npx tsc --noEmit 2>&1 | grep -E "swarm/backends|WindowsTerminal|detection"
-(no errors)
+（无错误）
 ```
 
-All new code compiles cleanly. The only pre-existing errors are in `WorkflowTool.ts`
-(unrelated to this PR).
+所有新代码编译通过。唯一的预存错误在 `WorkflowTool.ts` 中（与本 PR 无关）。
 
 ---
 
-## 7. Testing Notes
+## 7. 测试说明
 
-**Cannot be tested in this environment** (Linux, no Windows Terminal).
-Testing requires:
+**当前环境无法测试**（Linux，无 Windows Terminal）。
+测试需要：
 
-- [ ] Windows 10/11 with Windows Terminal installed
-- [ ] WSL with Windows Terminal interop
-- [ ] Verify `WT_SESSION` env var is detected
-- [ ] Verify `wt.exe -?` returns code 0
-- [ ] Verify `wt.exe -w 0 split-pane -V --title "test" -- cmd.exe /k echo hello`
-- [ ] Verify deferred creation pattern works end-to-end
-- [ ] Verify customCommand spawns non-Claude tools correctly
+- [ ] Windows 10/11 + 已安装 Windows Terminal
+- [ ] WSL + Windows Terminal 互操作
+- [ ] 验证 `WT_SESSION` 环境变量被正确检测
+- [ ] 验证 `wt.exe -?` 返回退出码 0
+- [ ] 验证 `wt.exe -w 0 split-pane -V --title "test" -- cmd.exe /k echo hello`
+- [ ] 验证延迟创建模式端到端可用
+- [ ] 验证 customCommand 可启动非 Claude 工具
