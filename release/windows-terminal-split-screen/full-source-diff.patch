@@ -1,0 +1,822 @@
+diff --git a/src/utils/swarm/backends/PaneBackendExecutor.ts b/src/utils/swarm/backends/PaneBackendExecutor.ts
+index a978e03..1b5c16a 100644
+--- a/src/utils/swarm/backends/PaneBackendExecutor.ts
++++ b/src/utils/swarm/backends/PaneBackendExecutor.ts
+@@ -110,48 +110,57 @@ export class PaneBackendExecutor implements TeammateExecutor {
+         await this.backend.enablePaneBorderStatus()
+       }
+ 
+-      // Build the command to spawn Claude Code with teammate identity
+-      const binaryPath = getTeammateCommand()
+-
+-      // Build teammate identity CLI args
+-      const teammateArgs = [
+-        `--agent-id ${quote([agentId])}`,
+-        `--agent-name ${quote([config.name])}`,
+-        `--team-name ${quote([config.teamName])}`,
+-        `--agent-color ${quote([teammateColor])}`,
+-        `--parent-session-id ${quote([config.parentSessionId || getSessionId()])}`,
+-        config.planModeRequired ? '--plan-mode-required' : '',
+-      ]
+-        .filter(Boolean)
+-        .join(' ')
+-
+-      // Build CLI flags to propagate to teammate
+-      const appState = this.context.getAppState()
+-      let inheritedFlags = buildInheritedCliFlags({
+-        planModeRequired: config.planModeRequired,
+-        permissionMode: appState.toolPermissionContext.mode,
+-      })
+-
+-      // If teammate has a custom model, add --model flag (or replace inherited one)
+-      if (config.model) {
+-        inheritedFlags = inheritedFlags
+-          .split(' ')
+-          .filter(
+-            (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
+-          )
++      // Build the spawn command
++      let spawnCommand: string
++      const workingDir = config.cwd
++
++      if (config.customCommand) {
++        // Custom command mode: use the provided command directly
++        // No teammate identity flags or inherited env vars are appended
++        spawnCommand = `cd ${quote([workingDir])} && ${config.customCommand}`
++      } else {
++        // Default mode: spawn Claude Code with teammate identity
++        const binaryPath = getTeammateCommand()
++
++        // Build teammate identity CLI args
++        const teammateArgs = [
++          `--agent-id ${quote([agentId])}`,
++          `--agent-name ${quote([config.name])}`,
++          `--team-name ${quote([config.teamName])}`,
++          `--agent-color ${quote([teammateColor])}`,
++          `--parent-session-id ${quote([config.parentSessionId || getSessionId()])}`,
++          config.planModeRequired ? '--plan-mode-required' : '',
++        ]
++          .filter(Boolean)
+           .join(' ')
+-        inheritedFlags = inheritedFlags
+-          ? `${inheritedFlags} --model ${quote([config.model])}`
+-          : `--model ${quote([config.model])}`
+-      }
+ 
+-      const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+-      const workingDir = config.cwd
++        // Build CLI flags to propagate to teammate
++        const appState = this.context.getAppState()
++        let inheritedFlags = buildInheritedCliFlags({
++          planModeRequired: config.planModeRequired,
++          permissionMode: appState.toolPermissionContext.mode,
++        })
++
++        // If teammate has a custom model, add --model flag (or replace inherited one)
++        if (config.model) {
++          inheritedFlags = inheritedFlags
++            .split(' ')
++            .filter(
++              (flag, i, arr) => flag !== '--model' && arr[i - 1] !== '--model',
++            )
++            .join(' ')
++          inheritedFlags = inheritedFlags
++            ? `${inheritedFlags} --model ${quote([config.model])}`
++            : `--model ${quote([config.model])}`
++        }
+ 
+-      // Build environment variables to forward to teammate
+-      const envStr = buildInheritedEnvVars()
++        const flagsStr = inheritedFlags ? ` ${inheritedFlags}` : ''
+ 
+-      const spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
++        // Build environment variables to forward to teammate
++        const envStr = buildInheritedEnvVars()
++
++        spawnCommand = `cd ${quote([workingDir])} && env ${envStr} ${quote([binaryPath])} ${teammateArgs}${flagsStr}`
++      }
+ 
+       // Send the command to the new pane
+       // Use swarm socket when running outside tmux (external swarm session)
+@@ -175,15 +184,18 @@ export class PaneBackendExecutor implements TeammateExecutor {
+       }
+ 
+       // Send initial instructions to teammate via mailbox
+-      await writeToMailbox(
+-        config.name,
+-        {
+-          from: 'team-lead',
+-          text: config.prompt,
+-          timestamp: new Date().toISOString(),
+-        },
+-        config.teamName,
+-      )
++      // Skip for custom commands that don't use the Claude mailbox system
++      if (!config.skipMailbox) {
++        await writeToMailbox(
++          config.name,
++          {
++            from: 'team-lead',
++            text: config.prompt,
++            timestamp: new Date().toISOString(),
++          },
++          config.teamName,
++        )
++      }
+ 
+       logForDebugging(
+         `[PaneBackendExecutor] Spawned teammate ${agentId} in pane ${paneId}`,
+diff --git a/src/utils/swarm/backends/WindowsTerminalBackend.ts b/src/utils/swarm/backends/WindowsTerminalBackend.ts
+new file mode 100644
+index 0000000..f596b63
+--- /dev/null
++++ b/src/utils/swarm/backends/WindowsTerminalBackend.ts
+@@ -0,0 +1,360 @@
++import type { AgentColorName } from '../../../tools/AgentTool/agentColorManager.js'
++import { logForDebugging } from '../../../utils/debug.js'
++import { execFileNoThrow } from '../../../utils/execFileNoThrow.js'
++import { sleep } from '../../sleep.js'
++import { isInWindowsTerminal, isWtCliAvailable, WT_COMMAND } from './detection.js'
++import { registerWindowsTerminalBackend } from './registry.js'
++import type { CreatePaneResult, PaneBackend, PaneId } from './types.js'
++
++/**
++ * Tracks created panes by their synthetic ID.
++ * Windows Terminal doesn't provide pane IDs (see microsoft/terminal#16568),
++ * so we generate synthetic IDs and associate them with metadata for
++ * deferred pane creation.
++ */
++type DeferredPane = {
++  name: string
++  color: AgentColorName
++  direction: '-V' | '-H'
++}
++
++// Track panes by synthetic ID
++const paneRegistry = new Map<string, DeferredPane>()
++
++// Track total pane count for layout decisions
++let paneCount = 0
++
++// Lock mechanism to prevent race conditions when spawning teammates in parallel
++let paneCreationLock: Promise<void> = Promise.resolve()
++
++// Delay after pane creation to allow shell initialization.
++// Slightly longer than tmux (200ms) because wt.exe spawns a new conhost process.
++const PANE_SHELL_INIT_DELAY_MS = 500
++
++function waitForPaneShellReady(): Promise<void> {
++  return sleep(PANE_SHELL_INIT_DELAY_MS)
++}
++
++/**
++ * Acquires a lock for pane creation, ensuring sequential execution.
++ * Returns a release function that must be called when done.
++ */
++function acquirePaneCreationLock(): Promise<() => void> {
++  let release: () => void
++  const newLock = new Promise<void>(resolve => {
++    release = resolve
++  })
++
++  const previousLock = paneCreationLock
++  paneCreationLock = newLock
++
++  return previousLock.then(() => release!)
++}
++
++/**
++ * Generates a synthetic pane ID since Windows Terminal doesn't provide them.
++ */
++function generatePaneId(): string {
++  return `wt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
++}
++
++/**
++ * WindowsTerminalBackend implements PaneBackend using Windows Terminal's
++ * native split-pane functionality via the wt.exe CLI.
++ *
++ * Reference: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
++ * Limitations & custom solution proposal: docs/08-windows-terminal-pane-management.md
++ *
++ * Key design decisions:
++ *
++ * 1. DEFERRED PANE CREATION: Windows Terminal's `wt.exe split-pane` requires
++ *    the command at creation time (unlike tmux where you create a pane then
++ *    send commands to it). So createTeammatePaneInSwarmView() returns a
++ *    synthetic pane ID, and sendCommandToPane() actually creates the split
++ *    pane with the command baked in.
++ *
++ * 2. NO PANE IDS: Windows Terminal doesn't expose pane IDs through its CLI.
++ *    (See microsoft/terminal#16568 for the feature request.)
++ *    We generate synthetic IDs for internal tracking only.
++ *
++ * 3. LIMITED POST-CREATION MANAGEMENT: After creation, we cannot query pane
++ *    state, send new commands, resize programmatically, or kill individual
++ *    panes. Windows Terminal handles its own layout. Available post-creation
++ *    operations are limited to directional navigation:
++ *    - move-focus --direction {up|down|left|right|first|previous|...}
++ *    - swap-pane --direction {up|down|left|right|...}
++ *
++ * 4. CROSS-PLATFORM: Works on both native Windows and WSL (via Windows interop).
++ *    On WSL, wt.exe is accessible through the /mnt/c path or directly in PATH.
++ *
++ * 5. SPLIT-PANE CLI FLAGS (official):
++ *    - `-H` / `--horizontal`: New pane below
++ *    - `-V` / `--vertical`: New pane to the right
++ *    - `-s` / `--size`: Decimal fraction of available space (0.0-1.0)
++ *    - `--title`: Custom pane title
++ *    - `-d` / `--startingDirectory`: Working directory
++ *    - `-p` / `--profile`: Terminal profile name or GUID
++ *    Note: `--tabColor` and `--colorScheme` are new-tab flags only,
++ *    NOT available on split-pane.
++ *
++ * Layout strategy:
++ * - First pane: vertical split (-V, --size 0.7) to create left/right layout
++ *   with leader on left (30%) and teammate on right (70%)
++ * - Subsequent panes: horizontal splits (-H) from right side to stack vertically
++ * - All panes target the current window (-w 0)
++ */
++export class WindowsTerminalBackend implements PaneBackend {
++  readonly type = 'windows-terminal' as const
++  readonly displayName = 'Windows Terminal'
++  readonly supportsHideShow = false
++
++  async isAvailable(): Promise<boolean> {
++    return isWtCliAvailable()
++  }
++
++  async isRunningInside(): Promise<boolean> {
++    return isInWindowsTerminal()
++  }
++
++  /**
++   * Creates a new teammate pane in the swarm view.
++   *
++   * Due to Windows Terminal's CLI design, actual pane creation is deferred
++   * to sendCommandToPane(). This method registers the pane and returns
++   * a synthetic ID.
++   */
++  async createTeammatePaneInSwarmView(
++    name: string,
++    color: AgentColorName,
++  ): Promise<CreatePaneResult> {
++    const releaseLock = await acquirePaneCreationLock()
++
++    try {
++      const paneId = generatePaneId()
++      const isFirstTeammate = paneCount === 0
++
++      // Determine split direction:
++      // First teammate: vertical split (creates left/right layout with leader)
++      // Subsequent: horizontal splits (stack vertically on the right side)
++      const direction = isFirstTeammate ? '-V' : '-H'
++
++      paneRegistry.set(paneId, { name, color, direction })
++      paneCount++
++
++      logForDebugging(
++        `[WindowsTerminalBackend] Registered pane for ${name}: ${paneId} (direction=${direction})`,
++      )
++
++      return { paneId, isFirstTeammate }
++    } finally {
++      releaseLock()
++    }
++  }
++
++  /**
++   * Sends a command to a specific pane.
++   *
++   * For Windows Terminal, this is where the actual split-pane creation happens.
++   * The command is executed directly in the new pane via `wt.exe -w 0 split-pane`.
++   *
++   * After the initial creation, subsequent calls for the same pane are no-ops
++   * since Windows Terminal doesn't support sending commands to existing panes
++   * (no equivalent to tmux send-keys or iTerm2 session run).
++   */
++  async sendCommandToPane(
++    paneId: PaneId,
++    command: string,
++    _useExternalSession?: boolean,
++  ): Promise<void> {
++    const paneInfo = paneRegistry.get(paneId)
++
++    if (!paneInfo) {
++      logForDebugging(
++        `[WindowsTerminalBackend] sendCommandToPane: pane ${paneId} not found in registry, treating as already created`,
++      )
++      return
++    }
++
++    const { name, direction } = paneInfo
++
++    // Build wt.exe split-pane command
++    // Reference: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
++    //
++    // -w 0: target the most recent window (current window)
++    // split-pane: create a new pane by splitting
++    // --title: set the pane title (visible in Windows Terminal UI)
++    // --size: decimal fraction of available space for the new pane
++    //
++    // Note: --tabColor is a new-tab flag only, NOT available on split-pane.
++    // Pane identification relies on --title since wt.exe has no pane ID system.
++    const wtArgs = [
++      '-w',
++      '0',
++      'split-pane',
++      direction,
++      '--title',
++      name,
++    ]
++
++    // First pane gets 70% of space (leader keeps 30%)
++    if (direction === '-V') {
++      wtArgs.push('--size', '0.7')
++    }
++
++    // Pass the command to execute in the new pane.
++    //
++    // The PaneBackendExecutor builds the full spawn command including:
++    //   cd <workingDir> && env KEY=VAL ... claude --agent-id ...
++    // (or a customCommand for non-Claude tools)
++    //
++    // On native Windows (win32): wrap in cmd.exe /k to keep pane alive
++    //   after command completion and for proper shell interpretation.
++    // On WSL: wrap in bash -c since the command contains shell constructs
++    //   (cd, &&, env vars). wt.exe on WSL creates a new WSL pane by default.
++    if (process.platform === 'win32') {
++      // cmd.exe /k runs command and stays open (unlike /c which closes)
++      wtArgs.push('cmd.exe', '/k', command)
++    } else {
++      // On WSL, bash -c interprets the compound command string
++      wtArgs.push('bash', '-c', command)
++    }
++
++    logForDebugging(
++      `[WindowsTerminalBackend] Creating split pane: wt.exe ${wtArgs.join(' ')}`,
++    )
++
++    const result = await execFileNoThrow(WT_COMMAND, wtArgs)
++
++    if (result.code !== 0) {
++      throw new Error(
++        `Failed to create Windows Terminal split pane for ${name}: ${result.stderr}`,
++      )
++    }
++
++    // Remove from deferred registry - pane is now created
++    paneRegistry.delete(paneId)
++
++    logForDebugging(
++      `[WindowsTerminalBackend] Created split pane for ${name}: ${paneId}`,
++    )
++
++    // Wait for shell to initialize in the new pane
++    await waitForPaneShellReady()
++  }
++
++  /**
++   * No-op for Windows Terminal.
++   * There is no post-creation API to change pane border colors.
++   * Color differentiation can only be done at pane creation time via
++   * terminal profile color schemes.
++   */
++  async setPaneBorderColor(
++    _paneId: PaneId,
++    _color: AgentColorName,
++    _useExternalSession?: boolean,
++  ): Promise<void> {
++    // Windows Terminal has no API to change pane colors after creation
++  }
++
++  /**
++   * No-op for Windows Terminal.
++   * Pane titles are set during creation via --title flag.
++   * There is no post-creation API to change pane titles.
++   */
++  async setPaneTitle(
++    _paneId: PaneId,
++    _name: string,
++    _color: AgentColorName,
++    _useExternalSession?: boolean,
++  ): Promise<void> {
++    // Title is set during pane creation via --title
++  }
++
++  /**
++   * No-op for Windows Terminal.
++   * Windows Terminal shows pane titles in its native UI automatically.
++   */
++  async enablePaneBorderStatus(
++    _windowTarget?: string,
++    _useExternalSession?: boolean,
++  ): Promise<void> {
++    // Windows Terminal shows pane information natively
++  }
++
++  /**
++   * No-op for Windows Terminal.
++   * Windows Terminal manages its own pane layout automatically.
++   * Users can manually resize panes with Alt+Shift+Arrow keys.
++   * Programmatic pane resizing is not available via wt.exe CLI.
++   */
++  async rebalancePanes(
++    _windowTarget: string,
++    _hasLeader: boolean,
++  ): Promise<void> {
++    logForDebugging(
++      '[WindowsTerminalBackend] Pane rebalancing delegated to Windows Terminal',
++    )
++  }
++
++  /**
++   * Attempts to close a pane.
++   *
++   * Windows Terminal doesn't provide a CLI to kill specific panes
++   * (no pane ID system, see microsoft/terminal#16568).
++   * We can only clean up internal tracking state.
++   * The actual pane closes when the process inside it exits, either:
++   * - Via mailbox shutdown request (graceful)
++   * - When the user manually closes it (Ctrl+Shift+W)
++   */
++  async killPane(
++    paneId: PaneId,
++    _useExternalSession?: boolean,
++  ): Promise<boolean> {
++    // Clean up internal state
++    const existed = paneRegistry.delete(paneId)
++    if (existed) {
++      paneCount = Math.max(0, paneCount - 1)
++    }
++
++    logForDebugging(
++      `[WindowsTerminalBackend] killPane ${paneId}: cleaned up tracking (actual pane closes when process exits)`,
++    )
++
++    // Return true - the pane will close when the process receives
++    // a shutdown request via the mailbox system
++    return true
++  }
++
++  /**
++   * Not supported in Windows Terminal.
++   * There is no equivalent to tmux's break-pane / join-pane.
++   */
++  async hidePane(
++    _paneId: PaneId,
++    _useExternalSession?: boolean,
++  ): Promise<boolean> {
++    logForDebugging(
++      '[WindowsTerminalBackend] hidePane not supported in Windows Terminal',
++    )
++    return false
++  }
++
++  /**
++   * Not supported in Windows Terminal.
++   * There is no equivalent to tmux's break-pane / join-pane.
++   */
++  async showPane(
++    _paneId: PaneId,
++    _targetWindowOrPane: string,
++    _useExternalSession?: boolean,
++  ): Promise<boolean> {
++    logForDebugging(
++      '[WindowsTerminalBackend] showPane not supported in Windows Terminal',
++    )
++    return false
++  }
++}
++
++// Register the backend with the registry when this module is imported.
++// eslint-disable-next-line custom-rules/no-top-level-side-effects
++registerWindowsTerminalBackend(WindowsTerminalBackend)
+diff --git a/src/utils/swarm/backends/detection.ts b/src/utils/swarm/backends/detection.ts
+index 4812fcd..dd94709 100644
+--- a/src/utils/swarm/backends/detection.ts
++++ b/src/utils/swarm/backends/detection.ts
+@@ -119,10 +119,57 @@ export async function isIt2CliAvailable(): Promise<boolean> {
+   return result.code === 0
+ }
+ 
++// =============================================================================
++// Windows Terminal Detection
++// =============================================================================
++
++/** Cached result for isInWindowsTerminal */
++let isInWindowsTerminalCached: boolean | null = null
++
++/**
++ * The Windows Terminal executable command name.
++ * Available on Windows and WSL (via Windows interop).
++ */
++export const WT_COMMAND = 'wt.exe'
++
++/**
++ * Checks if we're currently running inside Windows Terminal.
++ * Windows Terminal sets the WT_SESSION environment variable when a process
++ * runs inside it. This works both on native Windows and WSL.
++ *
++ * Caches the result since this won't change during the process lifetime.
++ */
++export function isInWindowsTerminal(): boolean {
++  if (isInWindowsTerminalCached !== null) {
++    return isInWindowsTerminalCached
++  }
++
++  // WT_SESSION is set by Windows Terminal for all sessions it hosts
++  isInWindowsTerminalCached = !!process.env.WT_SESSION
++
++  return isInWindowsTerminalCached
++}
++
++/**
++ * Checks if the wt.exe CLI is available on the system.
++ * On native Windows, wt.exe is in PATH when Windows Terminal is installed.
++ * On WSL, wt.exe is accessible via Windows interop (/mnt/c/... or directly in PATH).
++ *
++ * Uses `wt.exe -?` since wt.exe doesn't support `--version`.
++ * See: https://learn.microsoft.com/en-us/windows/terminal/command-line-arguments
++ */
++export async function isWtCliAvailable(): Promise<boolean> {
++  // wt.exe -? prints help and exits with code 0 if available.
++  // Unlike --version (which doesn't exist), -? is a documented flag.
++  const result = await execFileNoThrow(WT_COMMAND, ['-?'])
++  return result.code === 0
++}
++
+ /**
+  * Resets all cached detection results. Used for testing.
+  */
+ export function resetDetectionCache(): void {
+   isInsideTmuxCached = null
+   isInITerm2Cached = null
++  isInWindowsTerminalCached = null
+ }
+diff --git a/src/utils/swarm/backends/registry.ts b/src/utils/swarm/backends/registry.ts
+index 4035a82..a8bca73 100644
+--- a/src/utils/swarm/backends/registry.ts
++++ b/src/utils/swarm/backends/registry.ts
+@@ -3,10 +3,12 @@ import { logForDebugging } from '../../../utils/debug.js'
+ import { getPlatform } from '../../../utils/platform.js'
+ import {
+   isInITerm2,
++  isInWindowsTerminal,
+   isInsideTmux,
+   isInsideTmuxSync,
+   isIt2CliAvailable,
+   isTmuxAvailable,
++  isWtCliAvailable,
+ } from './detection.js'
+ import { createInProcessBackend } from './InProcessBackend.js'
+ import { getPreferTmuxOverIterm2 } from './it2Setup.js'
+@@ -65,6 +67,12 @@ let TmuxBackendClass: (new () => PaneBackend) | null = null
+  */
+ let ITermBackendClass: (new () => PaneBackend) | null = null
+ 
++/**
++ * Placeholder for WindowsTerminalBackend - will be replaced with actual implementation.
++ * This allows the registry to compile before the backend implementations exist.
++ */
++let WindowsTerminalBackendClass: (new () => PaneBackend) | null = null
++
+ /**
+  * Ensures backend classes are dynamically imported so getBackendByType() can
+  * construct them. Unlike detectAndGetBackend(), this never spawns subprocesses
+@@ -75,6 +83,7 @@ export async function ensureBackendsRegistered(): Promise<void> {
+   if (backendsRegistered) return
+   await import('./TmuxBackend.js')
+   await import('./ITermBackend.js')
++  await import('./WindowsTerminalBackend.js')
+   backendsRegistered = true
+ }
+ 
+@@ -99,6 +108,19 @@ export function registerITermBackend(
+   ITermBackendClass = backendClass
+ }
+ 
++/**
++ * Registers the WindowsTerminalBackend class with the registry.
++ * Called by WindowsTerminalBackend.ts to avoid circular dependencies.
++ */
++export function registerWindowsTerminalBackend(
++  backendClass: new () => PaneBackend,
++): void {
++  logForDebugging(
++    `[registry] registerWindowsTerminalBackend called, class=${backendClass?.name || 'undefined'}`,
++  )
++  WindowsTerminalBackendClass = backendClass
++}
++
+ /**
+  * Creates a TmuxBackend instance.
+  * Throws if TmuxBackend hasn't been registered.
+@@ -125,13 +147,26 @@ function createITermBackend(): PaneBackend {
+   return new ITermBackendClass()
+ }
+ 
++/**
++ * Creates a WindowsTerminalBackend instance.
++ * Throws if WindowsTerminalBackend hasn't been registered.
++ */
++function createWindowsTerminalBackend(): PaneBackend {
++  if (!WindowsTerminalBackendClass) {
++    throw new Error(
++      'WindowsTerminalBackend not registered. Import WindowsTerminalBackend.ts before using the registry.',
++    )
++  }
++  return new WindowsTerminalBackendClass()
++}
++
+ /**
+  * Detection priority flow:
+- * 1. If inside tmux, always use tmux (even in iTerm2)
++ * 1. If inside tmux, always use tmux (even in iTerm2 or Windows Terminal)
+  * 2. If in iTerm2 with it2 available, use iTerm2 backend
+- * 3. If in iTerm2 without it2, return result indicating setup needed
++ * 3. If in Windows Terminal with wt.exe available, use Windows Terminal backend
+  * 4. If tmux available, use tmux (creates external session)
+- * 5. Otherwise, throw error with instructions
++ * 5. Otherwise, throw error with platform-specific instructions
+  */
+ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
+   // Ensure backends are registered before detection
+@@ -150,9 +185,10 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
+   // Check all environment conditions upfront for logging
+   const insideTmux = await isInsideTmux()
+   const inITerm2 = isInITerm2()
++  const inWindowsTerminal = isInWindowsTerminal()
+ 
+   logForDebugging(
+-    `[BackendRegistry] Environment: insideTmux=${insideTmux}, inITerm2=${inITerm2}`,
++    `[BackendRegistry] Environment: insideTmux=${insideTmux}, inITerm2=${inITerm2}, inWindowsTerminal=${inWindowsTerminal}`,
+   )
+ 
+   // Priority 1: If inside tmux, always use tmux
+@@ -230,7 +266,45 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
+     )
+   }
+ 
+-  // Priority 3: Fall back to tmux external session
++  // Priority 3: If in Windows Terminal, use native split panes
++  if (inWindowsTerminal) {
++    const wtAvailable = await isWtCliAvailable()
++    logForDebugging(
++      `[BackendRegistry] Windows Terminal detected, wt.exe available: ${wtAvailable}`,
++    )
++
++    if (wtAvailable) {
++      logForDebugging(
++        '[BackendRegistry] Selected: windows-terminal (native Windows Terminal split panes)',
++      )
++      const backend = createWindowsTerminalBackend()
++      cachedBackend = backend
++      cachedDetectionResult = {
++        backend,
++        isNative: true,
++        needsIt2Setup: false,
++      }
++      return cachedDetectionResult
++    }
++
++    // In Windows Terminal but wt.exe not in PATH - try tmux as fallback
++    const tmuxFallback = await isTmuxAvailable()
++    if (tmuxFallback) {
++      logForDebugging(
++        '[BackendRegistry] Selected: tmux (fallback in Windows Terminal, wt.exe not in PATH)',
++      )
++      const backend = createTmuxBackend()
++      cachedBackend = backend
++      cachedDetectionResult = {
++        backend,
++        isNative: false,
++        needsIt2Setup: false,
++      }
++      return cachedDetectionResult
++    }
++  }
++
++  // Priority 4: Fall back to tmux external session
+   const tmuxAvailable = await isTmuxAvailable()
+   logForDebugging(
+     `[BackendRegistry] Not in tmux or iTerm2, tmux available: ${tmuxAvailable}`,
+@@ -250,13 +324,13 @@ export async function detectAndGetBackend(): Promise<BackendDetectionResult> {
+ 
+   // No backend available - tmux is not installed
+   logForDebugging('[BackendRegistry] ERROR: No pane backend available')
+-  throw new Error(getTmuxInstallInstructions())
++  throw new Error(getPaneBackendInstallInstructions())
+ }
+ 
+ /**
+  * Returns platform-specific tmux installation instructions.
+  */
+-function getTmuxInstallInstructions(): string {
++function getPaneBackendInstallInstructions(): string {
+   const platform = getPlatform()
+ 
+   switch (platform) {
+@@ -273,10 +347,12 @@ Then start a tmux session with: tmux new-session -s claude`
+ Then start a tmux session with: tmux new-session -s claude`
+ 
+     case 'windows':
+-      return `To use agent swarms, you need tmux which requires WSL (Windows Subsystem for Linux).
+-Install WSL first, then inside WSL run:
+-  sudo apt install tmux
+-Then start a tmux session with: tmux new-session -s claude`
++      return `To use agent swarms on Windows, you have two options:
++1. Use Windows Terminal (recommended): Install Windows Terminal from the Microsoft Store
++   and ensure wt.exe is in your PATH.
++2. Use tmux via WSL: Install WSL first, then inside WSL run:
++   sudo apt install tmux
++   Then start a tmux session with: tmux new-session -s claude`
+ 
+     default:
+       return `To use agent swarms, install tmux using your system's package manager.
+@@ -298,6 +374,8 @@ export function getBackendByType(type: PaneBackendType): PaneBackend {
+       return createTmuxBackend()
+     case 'iterm2':
+       return createITermBackend()
++    case 'windows-terminal':
++      return createWindowsTerminalBackend()
+   }
+ }
+ 
+@@ -376,14 +454,15 @@ export function isInProcessEnabled(): boolean {
+       return true
+     }
+     // Check if a pane backend environment is available
+-    // If inside tmux or iTerm2, use pane backend; otherwise use in-process
++    // If inside tmux, iTerm2, or Windows Terminal, use pane backend; otherwise use in-process
+     const insideTmux = isInsideTmuxSync()
+     const inITerm2 = isInITerm2()
+-    enabled = !insideTmux && !inITerm2
++    const inWT = isInWindowsTerminal()
++    enabled = !insideTmux && !inITerm2 && !inWT
+   }
+ 
+   logForDebugging(
+-    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${isInsideTmuxSync()}, inITerm2=${isInITerm2()})`,
++    `[BackendRegistry] isInProcessEnabled: ${enabled} (mode=${mode}, insideTmux=${isInsideTmuxSync()}, inITerm2=${isInITerm2()}, inWindowsTerminal=${isInWindowsTerminal()})`,
+   )
+   return enabled
+ }
+diff --git a/src/utils/swarm/backends/types.ts b/src/utils/swarm/backends/types.ts
+index b57964c..841a1e6 100644
+--- a/src/utils/swarm/backends/types.ts
++++ b/src/utils/swarm/backends/types.ts
+@@ -4,15 +4,16 @@ import type { AgentColorName } from '../../../tools/AgentTool/agentColorManager.
+  * Types of backends available for teammate execution.
+  * - 'tmux': Uses tmux for pane management (works in tmux or standalone)
+  * - 'iterm2': Uses iTerm2 native split panes via the it2 CLI
++ * - 'windows-terminal': Uses Windows Terminal native split panes via wt.exe
+  * - 'in-process': Runs teammate in the same Node.js process with isolated context
+  */
+-export type BackendType = 'tmux' | 'iterm2' | 'in-process'
++export type BackendType = 'tmux' | 'iterm2' | 'windows-terminal' | 'in-process'
+ 
+ /**
+  * Subset of BackendType for pane-based backends only.
+  * Used in messages and types that specifically deal with terminal panes.
+  */
+-export type PaneBackendType = 'tmux' | 'iterm2'
++export type PaneBackendType = 'tmux' | 'iterm2' | 'windows-terminal'
+ 
+ /**
+  * Opaque identifier for a pane managed by a backend.
+@@ -222,6 +223,23 @@ export type TeammateSpawnConfig = TeammateIdentity & {
+   /** Whether this teammate can show permission prompts for unlisted tools.
+    * When false (default), unlisted tools are auto-denied. */
+   allowPermissionPrompts?: boolean
++
++  /**
++   * Custom command to execute in the pane instead of the default Claude binary.
++   * When set, this command is used directly and teammate identity flags are NOT appended.
++   * This enables launching arbitrary CLI tools (e.g., cldex, gemini, custom scripts)
++   * in split panes.
++   *
++   * The command string is passed to the shell as-is.
++   * Example: "gemini --interactive" or "python my_agent.py"
++   */
++  customCommand?: string
++
++  /**
++   * If true, skip writing to the teammate mailbox after spawn.
++   * Useful when spawning non-Claude processes that don't use the mailbox system.
++   */
++  skipMailbox?: boolean
+ }
+ 
+ /**
+@@ -306,6 +324,8 @@ export type TeammateExecutor = {
+ /**
+  * Type guard to check if a backend type uses terminal panes.
+  */
+-export function isPaneBackend(type: BackendType): type is 'tmux' | 'iterm2' {
+-  return type === 'tmux' || type === 'iterm2'
++export function isPaneBackend(
++  type: BackendType,
++): type is 'tmux' | 'iterm2' | 'windows-terminal' {
++  return type === 'tmux' || type === 'iterm2' || type === 'windows-terminal'
+ }
