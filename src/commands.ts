@@ -350,6 +350,48 @@ export const builtInCommandNames = memoize(
     new Set(COMMANDS().flatMap(_ => [_.name, ...(_.aliases ?? [])])),
 )
 
+function getCommandIdentifiers(command: Command): string[] {
+  return [command.name, ...(command.aliases ?? [])]
+}
+
+function dedupeCommandsWithConflictLogging(
+  commands: Command[],
+  initialTakenIdentifiers: Map<string, Command> = new Map(),
+): Command[] {
+  const takenIdentifiers = new Map(initialTakenIdentifiers)
+  const deduped: Command[] = []
+
+  for (const command of commands) {
+    const conflicts = getCommandIdentifiers(command)
+      .map(identifier => {
+        const existing = takenIdentifiers.get(identifier)
+        if (!existing) return null
+        return { identifier, existing }
+      })
+      .filter((conflict): conflict is NonNullable<typeof conflict> =>
+        conflict !== null,
+      )
+
+    if (conflicts.length > 0) {
+      const conflictText = conflicts
+        .map(
+          ({ identifier, existing }) =>
+            `${identifier} (kept: ${existing.name}, dropped: ${command.name})`,
+        )
+        .join(', ')
+      logForDebugging(`Skipping command due to identifier conflicts: ${conflictText}`)
+      continue
+    }
+
+    deduped.push(command)
+    for (const identifier of getCommandIdentifiers(command)) {
+      takenIdentifiers.set(identifier, command)
+    }
+  }
+
+  return deduped
+}
+
 async function getSkills(cwd: string): Promise<{
   skillDirCommands: Command[]
   pluginSkills: Command[]
@@ -479,25 +521,38 @@ export async function getCommands(cwd: string): Promise<Command[]> {
   // Get dynamic skills discovered during file operations
   const dynamicSkills = getDynamicSkills()
 
-  // Build base commands without dynamic skills
-  const baseCommands = allCommands.filter(
-    _ => meetsAvailabilityRequirement(_) && isCommandEnabled(_),
+  // Root cause of duplicate slash commands:
+  // loadAllCommands() concatenates multiple sources, so same name/alias may
+  // appear more than once. Normalize once at this boundary.
+  const baseCommands = dedupeCommandsWithConflictLogging(
+    allCommands.filter(
+      _ => meetsAvailabilityRequirement(_) && isCommandEnabled(_),
+    ),
   )
 
   if (dynamicSkills.length === 0) {
     return baseCommands
   }
 
-  // Dedupe dynamic skills - only add if not already present
-  const baseCommandNames = new Set(baseCommands.map(c => c.name))
-  const uniqueDynamicSkills = dynamicSkills.filter(
-    s =>
-      !baseCommandNames.has(s.name) &&
-      meetsAvailabilityRequirement(s) &&
-      isCommandEnabled(s),
+  const baseIdentifierOwners = new Map(
+    baseCommands.flatMap(command =>
+      getCommandIdentifiers(command).map(identifier => [identifier, command]),
+    ),
+  )
+  const dynamicCandidates = dynamicSkills.filter(
+    skill => meetsAvailabilityRequirement(skill) && isCommandEnabled(skill),
   )
 
-  if (uniqueDynamicSkills.length === 0) {
+  if (dynamicCandidates.length === 0) {
+    return baseCommands
+  }
+
+  const dedupedDynamicSkills = dedupeCommandsWithConflictLogging(
+    dynamicCandidates,
+    baseIdentifierOwners,
+  )
+
+  if (dedupedDynamicSkills.length === 0) {
     return baseCommands
   }
 
@@ -506,12 +561,12 @@ export async function getCommands(cwd: string): Promise<Command[]> {
   const insertIndex = baseCommands.findIndex(c => builtInNames.has(c.name))
 
   if (insertIndex === -1) {
-    return [...baseCommands, ...uniqueDynamicSkills]
+    return [...baseCommands, ...dedupedDynamicSkills]
   }
 
   return [
     ...baseCommands.slice(0, insertIndex),
-    ...uniqueDynamicSkills,
+    ...dedupedDynamicSkills,
     ...baseCommands.slice(insertIndex),
   ]
 }
